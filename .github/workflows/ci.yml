@@ -11,14 +11,14 @@ jobs:
   test-and-package:
     runs-on: macos-latest
     timeout-minutes: 30
-    env:
-      # Darwin Unix sockets have a short path limit; upstream profile fixtures
-      # append descriptive names, so use the runner's shorter private temp root.
-      TMPDIR: ${{ runner.temp }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+      # Runner context is available in steps, not in job-level env expressions.
+      # Keep upstream Unix-socket fixture paths below Darwin's short path limit.
+      - name: Select short private temporary directory
+        run: printf 'TMPDIR=%s\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.x'
