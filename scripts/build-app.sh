@@ -3,7 +3,8 @@ set -euo pipefail
 ROOT="${0:A:h:h}"
 cd "$ROOT"
 zsh scripts/build-engine.sh
-swift build -c release -Xswiftc -file-prefix-map -Xswiftc "$HOME=/build" \
+swift build -c release -Xswiftc -gnone -Xcc -g0 \
+    -Xswiftc -file-prefix-map -Xswiftc "$HOME=/build" \
     -Xswiftc -file-prefix-map -Xswiftc "$ROOT=/source" \
     -Xcc "-ffile-prefix-map=$HOME=/build" -Xcc "-ffile-prefix-map=$ROOT=/source"
 BIN="$(swift build -c release --show-bin-path)"
@@ -14,6 +15,8 @@ cp packaging/Info.plist "$APP/Contents/Info.plist"
 cp "$BIN/RadminVPN" "$BIN/radmin-bridge" "$APP/Contents/MacOS/"
 cp native/target/release/radmin-mac-engine "$APP/Contents/MacOS/"
 cp native/target/release/radmin-identity-helper "$APP/Contents/MacOS/"
+# Remove object/debug paths before signing the distributed Swift executables.
+/usr/bin/strip -S "$APP/Contents/MacOS/RadminVPN" "$APP/Contents/MacOS/radmin-bridge"
 cp LICENSE NOTICE README.md "$APP/Contents/Resources/"
 cp vendor/openrad/LICENSE "$APP/Contents/Resources/OpenRad-LICENSE"
 cp vendor/openrad/UPSTREAM.json "$APP/Contents/Resources/OpenRad-UPSTREAM.json"
@@ -31,6 +34,7 @@ shasum -a 256 "$APP/Contents/MacOS/radmin-bridge" | cut -d ' ' -f 1 > "$APP/Cont
 codesign --verify --strict "$APP/Contents/MacOS/radmin-mac-engine"
 python3 scripts/sign-local.py --identifier dev.radminvpn.mac.native "$APP"
 codesign --verify --deep --strict "$APP"
+python3 scripts/check-app.py "$APP"
 # Do not ship Windows executables, DLLs, drivers or compatibility runtimes.
 if find "$APP" -type f \( -iname '*.exe' -o -iname '*.dll' -o -iname '*.sys' \) | read -r unexpected; then
     print -u2 "Unexpected Windows artifact: $unexpected"; exit 1
