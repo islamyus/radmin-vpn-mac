@@ -1,0 +1,17 @@
+{
+  "repository": "https://github.com/gringoestrangeiro/openrad",
+  "revision": "47eb54f6b051aadc37260d405681b2111b50b7cc",
+  "version": "2.0.1",
+  "license": "MIT",
+  "copyright": ["2026 estrangeiro", "2026 asimplestray"],
+  "local_changes": [
+    "src/platform/macos.rs: native utun boundary via Swift helper",
+    "src/tap.rs: select macOS backend",
+    "src/runtime.rs: enable cancellable macOS interface setup, retain a congested frame in FIFO order, bounded 256-frame Darwin peer queues and split drop accounting",
+    "src/peer.rs and src/udp.rs: reserve two UDP commands for control; regression-test congestion without advancing the cipher chain",
+    "src/session.rs: Darwin blocking-read contract, poll readiness and contextual authentication errors",
+    "src/udp.rs: portable connected-UDP tests, Darwin local-delivery synchronization and poll readiness",
+    "src/wake.rs: pollable local notifications on macOS instead of ignoring network/interface readiness",
+    "src/peer.rs: physical-interface test address when a transparent proxy owns the default route"
+  ]
+}

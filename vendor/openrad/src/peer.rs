@@ -1,0 +1,1873 @@
+//! Authenticated candidate selection, direct TCP/UDP, and TCP relay fallback.
+use crate::{
+    crypto::{random, Channel, ShClient, ShServer},
+    output::ReportDirectory,
+    protocol::*,
+    session::{Framed, Session},
+    tunnel,
+};
+use anyhow::{bail, ensure, Result};
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::VecDeque,
+    net::Ipv4Addr,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc,
+    },
+    time::{Duration, Instant},
+};
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TransportPath {
+    DirectTcp,
+    DirectUdp,
+    Relay,
+}
+impl TransportPath {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::DirectTcp => "Direct TCP",
+            Self::DirectUdp => "Direct UDP",
+            Self::Relay => "Relay",
+        }
+    }
+}
+#[derive(Clone, Default, Serialize)]
+pub struct TransportReport {
+    pub incoming: bool,
+    pub path: Option<TransportPath>,
+    pub tcp_candidates: Vec<TcpCandidate>,
+    pub udp_candidates: Vec<TcpCandidate>,
+    pub mapped_udp_candidates: Vec<TcpCandidate>,
+    pub attempts: Vec<serde_json::Value>,
+    pub authenticated: bool,
+    pub service_connected: bool,
+    pub endpoint: Option<std::net::SocketAddr>,
+}
+pub enum PeerStream {
+    Tcp(Framed),
+    Udp(crate::udp::Enet),
+}
+impl PeerStream {
+    pub fn send(&mut self, data: &[u8]) -> Result<()> {
+        match self {
+            Self::Tcp(s) => s.send(data),
+            Self::Udp(s) => s.send(data),
+        }
+    }
+    pub fn receive(&mut self, max: usize) -> Result<Vec<u8>> {
+        match self {
+            Self::Tcp(s) => s.receive(max),
+            Self::Udp(s) => s.receive(max),
+        }
+    }
+    pub fn ready(&mut self, timeout_ms: i32) -> Result<bool> {
+        match self {
+            Self::Tcp(s) => s.ready(timeout_ms),
+            Self::Udp(s) => s.ready(timeout_ms),
+        }
+    }
+    pub(crate) fn ready_or_wake(
+        &mut self,
+        timeout_ms: i32,
+        wake: &crate::wake::Wake,
+    ) -> Result<bool> {
+        match self {
+            Self::Tcp(s) => s.ready_or_wake(timeout_ms, wake),
+            Self::Udp(s) => s.ready_or_wake(timeout_ms, wake),
+        }
+    }
+    pub fn set_stop(&mut self, stop: Option<Arc<AtomicBool>>) {
+        match self {
+            Self::Tcp(s) => s.set_stop(stop),
+            Self::Udp(s) => s.set_stop(stop),
+        }
+    }
+    pub fn has_room(&self, len: usize) -> bool {
+        match self {
+            Self::Tcp(_) => true,
+            Self::Udp(s) => s.has_room(len),
+        }
+    }
+    fn has_data_room(&self, len: usize) -> bool {
+        match self { Self::Tcp(_) => true, Self::Udp(s) => s.has_data_room(len) }
+    }
+    pub fn sustain(&mut self) {
+        match self {
+            Self::Tcp(s) => s.sustain(),
+            Self::Udp(s) => s.sustain(),
+        }
+    }
+    pub fn endpoint(&self) -> Result<std::net::SocketAddr> {
+        match self {
+            Self::Tcp(s) => Ok(s.socket.peer_addr()?),
+            Self::Udp(s) => Ok(s.endpoint()),
+        }
+    }
+}
+pub struct PeerChannel {
+    pub peer: Peer,
+    pub mac: [u8; 6],
+    pub version: u32,
+    pub stream: PeerStream,
+    pub transport: TransportReport,
+    channel: Channel,
+    _coordinator: Option<Session>,
+}
+pub(crate) struct RelayOffer {
+    pub host: String,
+    pub port: u16,
+    pub ticket: Vec<u8>,
+    pub received_at: Instant,
+}
+const DIRECT_HEAD_START: Duration = Duration::from_secs(4);
+const MAX_RELAY_WAIT: Duration = Duration::from_secs(8);
+
+impl RelayOffer {
+    pub(crate) fn ready(
+        &self,
+        now: Instant,
+        last_direct_start: Option<Instant>,
+        direct_exhausted: bool,
+    ) -> bool {
+        // Late mapped UDP candidates deserve their own head start. Bound the
+        // extension so a silent direct path cannot suppress the relay forever.
+        let start_at = (last_direct_start
+            .unwrap_or(self.received_at)
+            .max(self.received_at)
+            + DIRECT_HEAD_START)
+            .min(self.received_at + MAX_RELAY_WAIT);
+        direct_exhausted || now >= start_at
+    }
+}
+
+/// Prepare only the relay socket and ticket pairing. Peer authentication stays
+/// behind RelayOffer::ready, so preconnecting cannot steal the direct head start.
+/// Own and join this worker even when a direct channel wins or setup is cancelled.
+pub(crate) struct RelayPreparation {
+    results: mpsc::Receiver<crate::scheduling::SetupResult<Framed>>,
+    cancel: Arc<AtomicBool>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+impl RelayPreparation {
+    pub(crate) fn start(offer: &RelayOffer, until: Instant) -> std::io::Result<Self> {
+        let (host, port, ticket) = (offer.host.clone(), offer.port, offer.ticket.clone());
+        let (sender, results) = mpsc::sync_channel(1);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let stop = cancel.clone();
+        let worker = std::thread::Builder::new()
+            .name("relay-prepare".into())
+            .spawn(move || {
+                let started = Instant::now();
+                let result = (|| -> Result<Framed> {
+                    let mut stream = Framed::connect_with_stop(
+                        &host,
+                        port,
+                        until.saturating_duration_since(Instant::now()),
+                        Some(stop),
+                    )?;
+                    stream.send(
+                        &[
+                            u32v(0x010001df, 1),
+                            u32v(0x0100032b, 2),
+                            tlv(0x090001ca, &ticket),
+                        ]
+                        .concat(),
+                    )?;
+                    // Starting early must not shorten the other member's old
+                    // pairing budget while it still tries late direct candidates.
+                    let pairing_until =
+                        until.min(Instant::now() + Duration::from_secs(25) + MAX_RELAY_WAIT);
+                    while !stream.ready(50)? {
+                        ensure!(Instant::now() < pairing_until, "relay pairing timeout");
+                    }
+                    ensure!(
+                        int32(field(&records(&stream.receive(65536)?)?, 0x010001df)?)? == 2,
+                        "relay ticket rejected"
+                    );
+                    Ok(stream)
+                })();
+                let _ = sender.try_send(crate::scheduling::SetupResult {
+                    name: "relay_preparation",
+                    elapsed: started.elapsed(),
+                    result,
+                });
+            })?;
+        Ok(Self {
+            results,
+            cancel,
+            worker: Some(worker),
+        })
+    }
+    pub(crate) fn poll(&self) -> Option<crate::scheduling::SetupResult<Framed>> {
+        let mut result = self.results.try_recv().ok()?;
+        if let Ok(stream) = &mut result.result {
+            // Ownership now belongs to orchestration. The eventual transport
+            // worker installs its own cancellation flag before using the socket.
+            stream.set_stop(None);
+        }
+        Some(result)
+    }
+}
+impl Drop for RelayPreparation {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn order_tcp_candidates(candidates: &[TcpCandidate]) -> Vec<TcpCandidate> {
+    // Diversify the first wave across address families and LAN/public paths.
+    // Every endpoint still comes from the correlated authenticated coordinator.
+    let mut groups: [VecDeque<TcpCandidate>; 4] = std::array::from_fn(|_| VecDeque::new());
+    for candidate in candidates {
+        let (private, v6) = match candidate.endpoint.ip() {
+            std::net::IpAddr::V4(v) => (
+                v.is_private() || v.is_loopback() || v.is_link_local(),
+                false,
+            ),
+            std::net::IpAddr::V6(v) => (
+                v.is_unique_local() || v.is_loopback() || v.segments()[0..2] == [0x2001, 0],
+                true,
+            ),
+        };
+        groups[usize::from(private) * 2 + usize::from(v6)].push_back(candidate.clone());
+    }
+    let mut ordered = Vec::with_capacity(candidates.len());
+    while ordered.len() < candidates.len() {
+        for group in &mut groups {
+            if let Some(candidate) = group.pop_front() {
+                ordered.push(candidate);
+            }
+        }
+    }
+    ordered
+}
+
+#[derive(Clone)]
+struct PeerDial<'a> {
+    identity: &'a Identity,
+    own_ip: Ipv4Addr,
+    peer: Peer,
+    password: Vec<u8>,
+    reports: &'a ReportDirectory,
+}
+impl PeerDial<'_> {
+    fn authenticate(
+        &self,
+        stream: PeerStream,
+        path: TransportPath,
+        name: &str,
+    ) -> Result<PeerChannel> {
+        PeerChannel::authenticate_peer(
+            stream,
+            path,
+            &self.password,
+            self.identity,
+            self.own_ip,
+            self.peer.clone(),
+            &self.reports.child(name)?,
+        )
+    }
+}
+
+impl PeerChannel {
+    pub fn connect(
+        identity: &Identity,
+        modulus: &[u8],
+        own_ip: Ipv4Addr,
+        peer: Peer,
+        reports: &ReportDirectory,
+        duration: Duration,
+    ) -> Result<Self> {
+        Self::connect_with_stop(identity, modulus, own_ip, peer, reports, duration, None)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn connect_with_stop(
+        identity: &Identity,
+        modulus: &[u8],
+        own_ip: Ipv4Addr,
+        peer: Peer,
+        reports: &ReportDirectory,
+        duration: Duration,
+        stop: Option<Arc<AtomicBool>>,
+    ) -> Result<Self> {
+        Self::connect_observed(
+            identity,
+            modulus,
+            own_ip,
+            peer,
+            reports,
+            duration,
+            stop,
+            false,
+            |_| {},
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn connect_observed(
+        identity: &Identity,
+        modulus: &[u8],
+        own_ip: Ipv4Addr,
+        peer: Peer,
+        reports: &ReportDirectory,
+        duration: Duration,
+        stop: Option<Arc<AtomicBool>>,
+        force_relay: bool,
+        observe: impl FnOnce(&TransportReport),
+    ) -> Result<Self> {
+        let mut report = TransportReport::default();
+        let result = Self::connect_inner(
+            identity,
+            modulus,
+            own_ip,
+            peer,
+            reports,
+            duration,
+            stop,
+            force_relay,
+            &mut report,
+        );
+        observe(&report);
+        reports.json("transport.json", &report)?;
+        result
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn connect_inner(
+        identity: &Identity,
+        modulus: &[u8],
+        own_ip: Ipv4Addr,
+        peer: Peer,
+        reports: &ReportDirectory,
+        duration: Duration,
+        stop: Option<Arc<AtomicBool>>,
+        force_relay: bool,
+        report: &mut TransportReport,
+    ) -> Result<Self> {
+        let started = Instant::now();
+        let host = peer
+            .server
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("peer has no authenticated server"))?;
+        let mut coord = Session::authenticate_with_stop(
+            host,
+            identity,
+            modulus,
+            5,
+            reports,
+            duration,
+            stop.clone(),
+        )?;
+        coord.send(&login(
+            &identity.node_name,
+            coord.latency,
+            5,
+            Some(peer.rid),
+        )?)?;
+        report.attempts.push(serde_json::json!({"phase":"coordinator_authenticated","setup_ms":started.elapsed().as_millis()}));
+        Self::negotiate(
+            identity,
+            own_ip,
+            peer,
+            reports,
+            duration.saturating_sub(started.elapsed()),
+            stop,
+            coord,
+            force_relay,
+            report,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn negotiate(
+        identity: &Identity,
+        own_ip: Ipv4Addr,
+        peer: Peer,
+        reports: &ReportDirectory,
+        duration: Duration,
+        stop: Option<Arc<AtomicBool>>,
+        mut coord: Session,
+        force_relay: bool,
+        report: &mut TransportReport,
+    ) -> Result<Self> {
+        let negotiation_started = Instant::now();
+        let until = Instant::now() + duration;
+        let route_ip = coord.stream.socket.local_addr()?.ip();
+        let mut discovery_until = until.min(Instant::now() + Duration::from_secs(30));
+        let mut pending: Option<(u64, Vec<u8>)> = None;
+        let mut server_id = None;
+        let mut ues = vec![];
+        let mut mapping = None;
+        let mut udp_socket = None;
+        let mut mapped_socket = None;
+        let mut udp_nonce = None;
+        let mut mapped_nonce = None;
+        let mut tcp_started = false;
+        let mut tcp_received = force_relay;
+        let mut udp_received = force_relay;
+        let mut mapped_received = true;
+        let mut relay = None;
+        let mut relay_preparation = None;
+        let mut relay_stream = None;
+        let mut relay_started = false;
+        let mut last_direct_start = None;
+        let mut records_received = 0;
+        let mut channel = std::thread::scope(|scope| -> Result<Self> {
+            // This guard cancels every losing transport before scope joins it,
+            // including on malformed coordinator messages or user cancellation.
+            let mut tasks = crate::scheduling::SetupTasks::<Self>::new();
+            loop {
+                ensure!(
+                    !stop
+                        .as_ref()
+                        .is_some_and(|s| s.load(std::sync::atomic::Ordering::Relaxed)),
+                    "cancelled"
+                );
+                ensure!(Instant::now() < until, "peer setup timeout");
+                while let Some(completed) = tasks.poll() {
+                    match completed.result {
+                        Ok(channel) => {
+                            report.attempts.push(serde_json::json!({
+                                "phase":completed.name, "result":"authenticated_service",
+                                "setup_ms":completed.elapsed.as_millis(), "endpoint":channel.transport.endpoint,
+                            }));
+                            return Ok(channel);
+                        }
+                        Err(error) => report.attempts.push(serde_json::json!({
+                            "phase":completed.name, "error":format!("{error:#}"),
+                            "setup_ms":completed.elapsed.as_millis(),
+                        })),
+                    }
+                }
+                if let Some(result) = mapping
+                    .as_ref()
+                    .and_then(crate::udp::MappingDiscovery::poll)
+                {
+                    mapping = None;
+                    match result {
+                        Ok((socket, endpoint)) => {
+                            let cid = pending
+                                .as_ref()
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!("mapped candidates before NewConnection")
+                                })?
+                                .0;
+                            coord.send(&advertise_mapped_udp(cid, endpoint)?)?;
+                            mapped_socket = Some(socket);
+                            mapped_received = mapped_nonce.is_some();
+                            report.attempts.push(serde_json::json!({"phase":"ues_mapping","endpoint":endpoint,"result":"two_servers_agree"}));
+                        }
+                        Err(error) => report.attempts.push(
+                            serde_json::json!({"phase":"ues_mapping","error":error.to_string()}),
+                        ),
+                    }
+                }
+                if let Some(prepared) = relay_preparation.as_ref().and_then(RelayPreparation::poll)
+                {
+                    relay_preparation = None;
+                    match prepared.result {
+                        Ok(stream) => {
+                            report.attempts.push(serde_json::json!({
+                                "phase": prepared.name, "result": "paired",
+                                "setup_ms": prepared.elapsed.as_millis(),
+                            }));
+                            relay_stream = Some(stream);
+                        }
+                        Err(error) => {
+                            relay_started = true;
+                            report.attempts.push(serde_json::json!({
+                                "phase": prepared.name, "error": format!("{error:#}"),
+                                "setup_ms": prepared.elapsed.as_millis(),
+                            }));
+                        }
+                    }
+                }
+                if let Some((cid, password)) = &pending {
+                    let dial = || PeerDial {
+                        identity,
+                        own_ip,
+                        peer: peer.clone(),
+                        password: password.clone(),
+                        reports,
+                    };
+                    if !force_relay && !tcp_started && !report.tcp_candidates.is_empty() {
+                        if let Some(server_id) = server_id {
+                            tcp_started = true;
+                            last_direct_start = Some(Instant::now());
+                            let candidates = order_tcp_candidates(&report.tcp_candidates);
+                            let lanes = candidates.len().min(crate::scheduling::DIRECT_TCP_LANES);
+                            report.attempts.push(serde_json::json!({
+                                "phase": "direct_tcp_start", "candidates": candidates.len(), "lanes": lanes,
+                            }));
+                            for (lane, name) in [
+                                "direct-tcp-0",
+                                "direct-tcp-1",
+                                "direct-tcp-2",
+                                "direct-tcp-3",
+                            ]
+                            .into_iter()
+                            .take(lanes)
+                            .enumerate()
+                            {
+                                let candidates: Vec<_> = candidates
+                                    .iter()
+                                    .skip(lane)
+                                    .step_by(lanes)
+                                    .cloned()
+                                    .collect();
+                                let dial = dial();
+                                let cid = *cid;
+                                tasks.spawn(scope, name, move |cancel| {
+                                    let deadline =
+                                        until.min(Instant::now() + Duration::from_secs(8));
+                                    let mut errors = vec![];
+                                    for candidate in candidates {
+                                        if Instant::now() >= deadline
+                                            || cancel.load(std::sync::atomic::Ordering::Relaxed)
+                                        {
+                                            break;
+                                        }
+                                        let result = (|| {
+                                            let mut stream = Framed::connect_timeout(
+                                                &candidate.endpoint.ip().to_string(),
+                                                candidate.endpoint.port(),
+                                                deadline
+                                                    .saturating_duration_since(Instant::now())
+                                                    .min(Duration::from_secs(3)),
+                                                Some(cancel.clone()),
+                                                Duration::from_secs(2),
+                                            )?;
+                                            stream.peer_rendezvous(identity.rid, cid, server_id)?;
+                                            dial.authenticate(
+                                                PeerStream::Tcp(stream),
+                                                TransportPath::DirectTcp,
+                                                name,
+                                            )
+                                        })();
+                                        match result {
+                                            Ok(channel) => return Ok(channel),
+                                            Err(error) => errors
+                                                .push(format!("{}: {error:#}", candidate.endpoint)),
+                                        }
+                                    }
+                                    bail!("direct TCP candidates failed: {}", errors.join("; "))
+                                })?;
+                            }
+                        }
+                    }
+                    for (name, socket, candidates, nonce) in [
+                        (
+                            "direct-udp",
+                            &mut udp_socket,
+                            &report.udp_candidates,
+                            udp_nonce,
+                        ),
+                        (
+                            "mapped-udp",
+                            &mut mapped_socket,
+                            &report.mapped_udp_candidates,
+                            mapped_nonce,
+                        ),
+                    ] {
+                        if let Some(nonce) = nonce.filter(|_| !candidates.is_empty()) {
+                            if let Some(socket) = socket.take() {
+                                last_direct_start = Some(Instant::now());
+                                let endpoints: Vec<_> =
+                                    candidates.iter().map(|c| c.endpoint).collect();
+                                let dial = dial();
+                                tasks.spawn(scope, name, move |cancel| {
+                                    let stream = crate::udp::Enet::connect(
+                                        socket,
+                                        &endpoints,
+                                        nonce,
+                                        until
+                                            .saturating_duration_since(Instant::now())
+                                            .min(Duration::from_secs(8)),
+                                        Some(cancel),
+                                    )?;
+                                    dial.authenticate(
+                                        PeerStream::Udp(stream),
+                                        TransportPath::DirectUdp,
+                                        name,
+                                    )
+                                })?;
+                            }
+                        }
+                    }
+                    let direct_exhausted = tasks.is_idle()
+                        && mapping.is_none()
+                        && tcp_received
+                        && udp_received
+                        && mapped_received;
+                    if !relay_started
+                        && relay_stream.is_some()
+                        && relay.as_ref().is_some_and(|r: &RelayOffer| {
+                            r.ready(Instant::now(), last_direct_start, direct_exhausted)
+                        })
+                    {
+                        relay_started = true;
+                        let mut stream = relay_stream.take().unwrap();
+                        let dial = dial();
+                        tasks.spawn(scope, "relay", move |cancel| {
+                            stream.set_stop(Some(cancel));
+                            dial.authenticate(
+                                PeerStream::Tcp(stream),
+                                TransportPath::Relay,
+                                "relay",
+                            )
+                        })?;
+                    }
+                }
+                let discovery_complete =
+                    tcp_received && udp_received && mapped_received && relay_started;
+                if discovery_complete || records_received >= 32 || Instant::now() >= discovery_until
+                {
+                    if tasks.is_idle() && mapping.is_none() && (relay_started || relay.is_none()) {
+                        bail!("all peer transports failed or no authenticated candidates arrived");
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                if !coord.stream.ready(10)? {
+                    continue;
+                }
+                let data = coord.receive()?;
+                records_received += 1;
+                report.attempts.push(serde_json::json!({"phase":"coordinator_record","operation":op(&data)?,"elapsed_ms":negotiation_started.elapsed().as_millis()}));
+                let fields = records(&data)?;
+                match op(&data)? {
+                    21 => {
+                        server_id = optional(&fields, 0x0100025b)?.map(int32).transpose()?;
+                        ues = ues_hosts(&data)?;
+                    }
+                    11 => {
+                        ensure!(pending.is_none(), "duplicate NewConnection");
+                        let cid = int64(field(&fields, 0x020001c1)?)?;
+                        let f = records(field(&fields, 0x1235)?)?;
+                        ensure!(
+                            int64(field(&f, 0x020001e1)?)? == peer.rid,
+                            "NewConnection target mismatch"
+                        );
+                        let password = field(&f, 0x0a0001cd)?.to_vec();
+                        ensure!(
+                            cid != 0 && (6..=1024).contains(&password.len()),
+                            "invalid connection credentials"
+                        );
+                        pending = Some((cid, password));
+                        if !force_relay {
+                            coord.send(&request_tcp_candidates(cid))?;
+                            match crate::udp::bind_candidates(coord.stream.socket.local_addr()?.ip()) {
+                            Ok((socket, endpoints)) => {
+                                coord.send(&advertise_udp(cid, &endpoints, 0)?)?;
+                                udp_socket = Some(socket);
+                            }
+                            Err(error) => report.attempts.push(
+                                serde_json::json!({"phase":"local_bind","error":error.to_string()}),
+                            ),
+                        }
+                            mapping = Some(crate::udp::MappingDiscovery::start(ues.clone())?);
+                        }
+                        coord.send(&request_relay(cid))?;
+                    }
+                    operation @ (6 | 29) if !force_relay => {
+                        let cid = pending
+                            .as_ref()
+                            .ok_or_else(|| anyhow::anyhow!("candidates before NewConnection"))?
+                            .0;
+                        match direct_candidates_on_route(
+                            &data,
+                            cid,
+                            operation,
+                            if operation == 6 { 0x1236 } else { 0x127c },
+                            route_ip,
+                        ) {
+                            Ok((candidates, exclusions)) => {
+                                if operation == 6 {
+                                    report.tcp_candidates = candidates;
+                                    tcp_received = true;
+                                } else {
+                                    report.udp_candidates = candidates;
+                                    udp_received = true;
+                                }
+                                for error in exclusions {
+                                    report.attempts.push(serde_json::json!({"phase":"candidate_exclusion","error":error}));
+                                }
+                            }
+                            Err(error) => {
+                                report.attempts.push(serde_json::json!({"phase":"candidate_validation","error":error.to_string()}));
+                                continue;
+                            }
+                        }
+                        if operation == 29 {
+                            udp_nonce = optional(&fields, 0x127c)?
+                                .map(records)
+                                .transpose()?
+                                .map(|f| optional(&f, 0x0100020a)?.map(int32).transpose())
+                                .transpose()?
+                                .flatten()
+                                .filter(|n| (1..=65535).contains(n))
+                                .map(|n| n as u16);
+                        }
+                    }
+                    7 if !force_relay => {
+                        let cid = pending
+                            .as_ref()
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("mapped candidates before NewConnection")
+                            })?
+                            .0;
+                        match mapped_udp_candidate_on_route(&data, cid, route_ip) {
+                            Ok((candidate, nonce)) => {
+                                report.mapped_udp_candidates = vec![candidate];
+                                mapped_nonce = Some(nonce);
+                                mapped_received = true;
+                            }
+                            Err(error) => report.attempts.push(serde_json::json!({"phase":"mapped_candidate_validation","error":error.to_string()})),
+                        }
+                    }
+                    23 => {
+                        let cid = pending
+                            .as_ref()
+                            .ok_or_else(|| anyhow::anyhow!("relay before NewConnection"))?
+                            .0;
+                        ensure!(
+                            int64(field(&fields, 0x020001c1)?)? == cid,
+                            "relay correlation mismatch"
+                        );
+                        let f = records(field(&fields, 0x123f)?)?;
+                        let host = text(field(&f, 0x030001cb)?)?;
+                        let port = int32(field(&f, 0x010001cc)?)?;
+                        let ticket = field(&f, 0x090001ca)?.to_vec();
+                        ensure!(
+                            (1..=65535).contains(&port) && ticket.len() == 256,
+                            "invalid relay ticket"
+                        );
+                        if !relay_started && relay.is_none() {
+                            // Keep accepting delayed direct candidates while the
+                            // relay waits or pairs; early TCP must not cut off UDP.
+                            discovery_until =
+                                discovery_until.min(Instant::now() + Duration::from_secs(12));
+                            let offer = RelayOffer {
+                                host,
+                                port: port as u16,
+                                ticket,
+                                received_at: Instant::now(),
+                            };
+                            match RelayPreparation::start(&offer, until) {
+                                Ok(preparation) => relay_preparation = Some(preparation),
+                                Err(error) => {
+                                    relay_started = true;
+                                    report.attempts.push(serde_json::json!({"phase":"relay_preparation","error":error.to_string()}));
+                                }
+                            }
+                            relay = Some(offer);
+                        }
+                    }
+                    16 | 44 => bail!("coordinator refused connection: operation {}", op(&data)?),
+                    _ => {}
+                }
+            }
+        })?;
+        channel.stream.set_stop(stop);
+        channel.transport.tcp_candidates = report.tcp_candidates.clone();
+        channel.transport.udp_candidates = report.udp_candidates.clone();
+        channel.transport.mapped_udp_candidates = report.mapped_udp_candidates.clone();
+        channel.transport.attempts = report.attempts.clone();
+        *report = channel.transport.clone();
+        channel._coordinator = Some(coord);
+        Ok(channel)
+    }
+    fn authenticate_peer(
+        mut stream: PeerStream,
+        path: TransportPath,
+        password: &[u8],
+        identity: &Identity,
+        own_ip: Ipv4Addr,
+        peer: Peer,
+        reports: &ReportDirectory,
+    ) -> Result<Self> {
+        if path != TransportPath::Relay {
+            reports.json("peer.json", &peer)?;
+        }
+        let mut sh = ShClient::new(peer.rid, password)?;
+        stream.send(&sh.start()?)?;
+        let sh2 = stream.receive(65536)?;
+        stream.send(&sh.parameters(&sh2)?)?;
+        let sh4 = stream.receive(65536)?;
+        stream.send(&sh.challenge(&sh4)?)?;
+        let sh6 = stream.receive(65536)?;
+        let key = sh.confirm(&sh6)?;
+        let mut p = Self {
+            peer,
+            mac: [0; 6],
+            version: 0,
+            transport: TransportReport {
+                path: Some(path),
+                authenticated: true,
+                endpoint: Some(stream.endpoint()?),
+                ..Default::default()
+            },
+            stream,
+            channel: Channel::new(&key[..32])?,
+            _coordinator: None,
+        };
+        p.send(&[0xef, 0xbe, 0xad, 0xde])?;
+        let mut guid = random(16);
+        guid[7] = (guid[7] & 15) | 0x40;
+        guid[8] = (guid[8] & 63) | 0x80;
+        p.send(&guid)?;
+        p.send(&tunnel::syn(identity.rid, &tunnel::mac(own_ip)))?;
+        let (ack, mac, version) = tunnel::synack(&p.receive()?)?;
+        p.mac = mac;
+        p.version = version;
+        p.send(&ack)?;
+        p.transport.service_connected = true;
+        Ok(p)
+    }
+    pub fn accept_authenticated(
+        mut stream: PeerStream,
+        path: TransportPath,
+        password: &[u8],
+        own_rid: u64,
+        own_ip: Ipv4Addr,
+        peer: Peer,
+        reports: &ReportDirectory,
+    ) -> Result<Self> {
+        reports.json("peer.json", &peer)?;
+        reports.json(
+            "incoming.json",
+            &serde_json::json!({"own_rid":own_rid,"incoming":true}),
+        )?;
+        let mut sh = ShServer::new(own_rid, password)?;
+        // Relay tickets can arrive before the initiator exhausts its direct
+        // candidates. Keep the bounded incoming channel ready for that fallback.
+        let hello_until = Instant::now() + Duration::from_secs(25);
+        while !stream.ready(100)? {
+            ensure!(Instant::now() < hello_until, "incoming SH hello timeout");
+        }
+        let hello = stream.receive(65536)?;
+        stream.send(&sh.hello(&hello)?)?;
+        let public = stream.receive(65536)?;
+        stream.send(&sh.public(&public)?)?;
+        let proof = stream.receive(65536)?;
+        let (confirmation, key) = sh.proof(&proof)?;
+        stream.send(&confirmation)?;
+        let mut p = Self {
+            peer,
+            mac: [0; 6],
+            version: 0,
+            transport: TransportReport {
+                incoming: true,
+                path: Some(path),
+                authenticated: true,
+                endpoint: Some(stream.endpoint()?),
+                ..Default::default()
+            },
+            stream,
+            channel: Channel::new(&key[..32])?,
+            _coordinator: None,
+        };
+        ensure!(
+            p.receive()? == [0xef, 0xbe, 0xad, 0xde],
+            "incoming peer race marker mismatch"
+        );
+        ensure!(p.receive()?.len() == 16, "incoming peer race GUID length");
+        let (synack, mac, version) =
+            tunnel::accept_syn(&p.receive()?, p.peer.rid, &tunnel::mac(own_ip))?;
+        p.send(&synack)?;
+        tunnel::accept_ack(&p.receive()?, version)?;
+        p.mac = mac;
+        p.version = version;
+        p.transport.service_connected = true;
+        Ok(p)
+    }
+    /// Returns false when the transport window is full and the message was
+    /// dropped. The check precedes encryption: the CBC chain continues across
+    /// messages, so a ciphertext that is never sent would desynchronise the peer.
+    pub fn send(&mut self, plain: &[u8]) -> Result<bool> {
+        if !self.stream.has_room((plain.len() + 9).div_ceil(16) * 16) {
+            return Ok(false);
+        }
+        let ct = self.channel.encrypt(plain)?;
+        self.stream.send(&ct)?;
+        Ok(true)
+    }
+    pub fn receive(&mut self) -> Result<Vec<u8>> {
+        let ct = self.stream.receive(65536)?;
+        let pt = self.channel.decrypt_owned(ct)?;
+        Ok(pt)
+    }
+    /// A reusable buffer avoids envelope/ciphertext allocations for TAP traffic.
+    /// Keep the congestion check before encryption to preserve the CBC chain.
+    pub(crate) fn send_frame(&mut self, frame: &[u8], buffer: &mut Vec<u8>) -> Result<bool> {
+        crate::tunnel::encode_into(frame, buffer)?;
+        if !self.stream.has_data_room((buffer.len() + 9).div_ceil(16) * 16) {
+            return Ok(false);
+        }
+        self.channel.encrypt_in_place(buffer)?;
+        self.stream.send(buffer)?;
+        Ok(true)
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn synthetic_pair() -> (PeerChannel, PeerChannel) {
+    use std::net::{TcpListener, TcpStream};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let local = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let remote = listener.accept().unwrap().0;
+    let make = |socket, rid| PeerChannel {
+        peer: Peer {
+            rid,
+            name: "synthetic".into(),
+            vip: Ipv4Addr::new(26, 0, 0, rid as u8),
+            server: Some("127.0.0.1".into()),
+            state: 1,
+            network_ids: Default::default(),
+        },
+        mac: tunnel::mac(Ipv4Addr::new(26, 0, 0, rid as u8)),
+        version: 8,
+        transport: TransportReport {
+            path: Some(TransportPath::DirectTcp),
+            authenticated: true,
+            service_connected: true,
+            ..Default::default()
+        },
+        stream: PeerStream::Tcp(Framed::from_socket(socket, Duration::from_secs(5), None).unwrap()),
+        channel: Channel::new(&[17; 32]).unwrap(),
+        _coordinator: None,
+    };
+    (make(local, 2), make(remote, 1))
+}
+
+#[cfg(test)]
+pub(crate) fn synthetic_udp_pair() -> (PeerChannel, PeerChannel) {
+    use crate::udp::Enet;
+    use std::net::UdpSocket;
+    let a = UdpSocket::bind("[::1]:0").unwrap();
+    let b = UdpSocket::bind("[::1]:0").unwrap();
+    let (aa, ba) = (a.local_addr().unwrap(), b.local_addr().unwrap());
+    let reader = std::thread::spawn(move || Enet::accept(b, &[aa], 123, Duration::from_secs(5), None).unwrap());
+    let outgoing = Enet::connect(a, &[ba], 123, Duration::from_secs(5), None).unwrap();
+    let incoming = reader.join().unwrap();
+    let (mut local, mut remote) = synthetic_pair();
+    local.stream = PeerStream::Udp(outgoing);
+    remote.stream = PeerStream::Udp(incoming);
+    local.stream.sustain(); remote.stream.sustain();
+    (local, remote)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::udp::Enet;
+    use std::net::UdpSocket;
+
+    fn udp_channels() -> (PeerChannel, Enet, Channel) {
+        let a = UdpSocket::bind("[::1]:0").unwrap();
+        let b = UdpSocket::bind("[::1]:0").unwrap();
+        let aa = a.local_addr().unwrap();
+        let ba = b.local_addr().unwrap();
+        let incoming = std::thread::spawn(move || {
+            Enet::accept(b, &[aa], 123, Duration::from_secs(5), None).unwrap()
+        });
+        let mut outgoing = Enet::connect(a, &[ba], 123, Duration::from_secs(5), None).unwrap();
+        let mut receiver = incoming.join().unwrap();
+        outgoing.sustain();
+        receiver.sustain();
+        let key = [7; 32];
+        let decrypt = Channel::new(&key).unwrap();
+        let sender = PeerChannel {
+            peer: Peer {
+                rid: 1,
+                name: "Synthetic peer".into(),
+                vip: Ipv4Addr::new(26, 0, 0, 1),
+                server: None,
+                state: 1,
+                network_ids: Default::default(),
+            },
+            mac: [0; 6],
+            version: 0,
+            stream: PeerStream::Udp(outgoing),
+            transport: TransportReport::default(),
+            channel: Channel::new(&key).unwrap(),
+            _coordinator: None,
+        };
+
+        (sender, receiver, decrypt)
+    }
+
+    #[test]
+    fn a_thousand_full_size_udp_frames_keep_payload_order_and_cbc_chain_under_load() {
+        let (mut sender, mut receiver, mut decrypt) = udp_channels();
+        let reader = std::thread::spawn(move || {
+            for sequence in 0..1024u64 {
+                let plaintext = decrypt
+                    .decrypt_owned(receiver.receive(65536).unwrap())
+                    .unwrap();
+                let tunnel::Packet::Frames(frames) = tunnel::decode(&plaintext).unwrap() else {
+                    panic!("expected Ethernet");
+                };
+                assert_eq!(frames.len(), 1);
+                assert_eq!(frames[0].len(), tunnel::MAX_FRAME);
+                assert_eq!(frames[0][..8], sequence.to_be_bytes());
+                assert!(frames[0][8..]
+                    .iter()
+                    .all(|byte| *byte == (sequence % 251) as u8));
+            }
+            receiver
+        });
+        let mut scratch = Vec::with_capacity(1536);
+        let storage = scratch.as_ptr();
+        let mut frame = vec![0; tunnel::MAX_FRAME];
+        let until = Instant::now() + Duration::from_secs(15);
+        for sequence in 0..1024u64 {
+            frame[..8].copy_from_slice(&sequence.to_be_bytes());
+            frame[8..].fill((sequence % 251) as u8);
+            while !sender.stream.has_room(1536) {
+                assert!(
+                    Instant::now() < until,
+                    "send window did not recover under load"
+                );
+                sender.stream.ready(1).unwrap();
+            }
+            assert!(sender.send_frame(&frame, &mut scratch).unwrap());
+            assert_eq!(scratch.as_ptr(), storage);
+            sender.stream.ready(0).unwrap();
+        }
+        // Keep ACK/retry processing alive while the receiver drains the final
+        // burst; accepted UDP writes can still be lost in local socket queues.
+        while !reader.is_finished() {
+            assert!(
+                Instant::now() < until,
+                "receiver did not drain the final burst"
+            );
+            sender.stream.ready(20).unwrap();
+        }
+        let _remote = reader.join().unwrap();
+    }
+
+    #[test]
+    fn a_full_udp_window_drops_before_advancing_the_encryption_chain() {
+        let (mut sender, mut receiver, mut decrypt) = udp_channels();
+
+        // Deliver every message but leave ACKs unread on the sender, filling
+        // its window without losing packets to the local socket buffers.
+        for value in 0..=255u8 {
+            assert!(sender.send(&[value]).unwrap());
+            let ciphertext = receiver.receive(65536).unwrap();
+            assert_eq!(decrypt.decrypt(&ciphertext).unwrap(), [value]);
+        }
+        assert!(!sender.send(b"dropped").unwrap());
+        let frame = [3; 14];
+        let mut scratch = Vec::with_capacity(1536);
+        assert!(!sender.send_frame(&frame, &mut scratch).unwrap());
+        sender.stream.ready(0).unwrap();
+        assert!(sender.send(b"resumed").unwrap());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !receiver.ready(0).unwrap() {
+            assert!(
+                Instant::now() < deadline,
+                "resumed message was not delivered"
+            );
+            sender.stream.ready(0).unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let ciphertext = receiver.receive(65536).unwrap();
+        assert_eq!(decrypt.decrypt(&ciphertext).unwrap(), b"resumed");
+        let storage = scratch.as_ptr();
+        assert!(sender.send_frame(&frame, &mut scratch).unwrap());
+        assert_eq!(scratch.as_ptr(), storage);
+        let ciphertext = receiver.receive(65536).unwrap();
+        assert_eq!(
+            decrypt.decrypt_owned(ciphertext).unwrap(),
+            tunnel::encode(&frame).unwrap()
+        );
+    }
+}
+
+#[cfg(test)]
+mod connection_tests {
+    use super::*;
+    use std::{
+        io::{Read, Write},
+        net::{SocketAddr, TcpListener, TcpStream},
+        sync::{atomic::Ordering, mpsc},
+        thread,
+    };
+
+    const CID: u64 = 99;
+    const PASSWORD: &[u8] = b"synthetic-peer-password";
+
+    fn peer(rid: u64) -> Peer {
+        Peer {
+            rid,
+            name: "synthetic".into(),
+            vip: Ipv4Addr::new(26, 0, 0, rid as u8),
+            server: Some("127.0.0.1".into()),
+            state: 1,
+            network_ids: Default::default(),
+        }
+    }
+    fn identity() -> Identity {
+        let mut identity = Identity::bootstrap("synthetic", "127.0.0.1").unwrap();
+        identity.rid = 11;
+        identity.vip = peer(11).vip;
+        identity
+    }
+    fn coordinator() -> (Session, Session) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let local = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let remote = listener.accept().unwrap().0;
+        let session = |socket| Session {
+            stream: Framed::from_socket(socket, Duration::from_secs(5), None).unwrap(),
+            channel: Channel::new(&[17; 32]).unwrap(),
+            latency: 0,
+            ues: vec![],
+        };
+        let mut remote = session(remote);
+        let login = [u32v(SERVER_OP, 21), u32v(0x0100025b, 17)];
+        remote.send(&login.concat()).unwrap();
+        remote
+            .send(
+                &[
+                    u32v(SERVER_OP, 11),
+                    u64v(0x020001c1, CID),
+                    tlv(
+                        0x1235,
+                        &[u64v(0x020001e1, 42), tlv(0x0a0001cd, PASSWORD)].concat(),
+                    ),
+                ]
+                .concat(),
+            )
+            .unwrap();
+        (session(local), remote)
+    }
+    fn candidates(remote: &mut Session, endpoints: &[SocketAddr]) {
+        let body: Vec<_> = endpoints
+            .iter()
+            .flat_map(|endpoint| {
+                tlv(
+                    0x127d,
+                    &[
+                        textv(0x030001c2, &endpoint.ip().to_string()).unwrap(),
+                        u32v(0x010001c3, endpoint.port() as u32),
+                    ]
+                    .concat(),
+                )
+            })
+            .collect();
+        remote
+            .send(
+                &[
+                    u32v(SERVER_OP, 6),
+                    u64v(0x020001c1, CID),
+                    tlv(0x1236, &body),
+                ]
+                .concat(),
+            )
+            .unwrap();
+    }
+    fn respond(socket: TcpStream, path: TransportPath) {
+        let mut stream = Framed::from_socket(socket, Duration::from_secs(5), None).unwrap();
+        if path == TransportPath::Relay {
+            let ticket = stream.receive(65536).unwrap();
+            assert_eq!(
+                field(&records(&ticket).unwrap(), 0x090001ca).unwrap(),
+                &[23; 256]
+            );
+            stream.send(&u32v(0x010001df, 2)).unwrap();
+        } else {
+            stream.accept_rendezvous(11, CID).unwrap();
+        }
+        respond_stream(stream, path);
+    }
+    fn respond_stream(stream: Framed, path: TransportPath) {
+        let mut channel = PeerChannel::accept_authenticated(
+            PeerStream::Tcp(stream),
+            path,
+            PASSWORD,
+            42,
+            peer(42).vip,
+            peer(11),
+            &ReportDirectory::disabled(),
+        )
+        .unwrap();
+        let packet = channel.receive().unwrap();
+        let tunnel::Packet::Frames(frames) = tunnel::decode(&packet).unwrap() else {
+            panic!("expected Ethernet announcement");
+        };
+        assert_eq!(frames, [tunnel::gratuitous_arp(peer(11).vip).as_slice()]);
+        assert!(crate::runtime::valid_inbound(
+            frames[0],
+            peer(42).vip,
+            peer(11).vip,
+            channel.mac,
+        ));
+        channel.send(b"confirmed").unwrap();
+    }
+    fn responder(listener: TcpListener, path: TransportPath) -> thread::JoinHandle<()> {
+        thread::spawn(move || respond(listener.accept().unwrap().0, path))
+    }
+    fn relay_offer(remote: &mut Session, port: u16) {
+        remote.send(&relay_record(port)).unwrap();
+    }
+    fn relay_record(port: u16) -> Vec<u8> {
+        [
+            u32v(SERVER_OP, 23),
+            u64v(0x020001c1, CID),
+            tlv(
+                0x123f,
+                &[
+                    textv(0x030001cb, "127.0.0.1").unwrap(),
+                    u32v(0x010001cc, port as u32),
+                    tlv(0x090001ca, &[23; 256]),
+                ]
+                .concat(),
+            ),
+        ]
+        .concat()
+    }
+    fn stalled_listener() -> (SocketAddr, mpsc::Receiver<()>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut preamble = [0; 24];
+            socket.read_exact(&mut preamble).unwrap();
+            sender.send(()).unwrap();
+            let mut byte = [0];
+            assert_eq!(
+                socket.read(&mut byte).unwrap(),
+                0,
+                "losing socket must be closed"
+            );
+        });
+        (address, receiver, worker)
+    }
+    fn exchange(mut channel: PeerChannel) {
+        channel
+            .send(&tunnel::encode(&tunnel::gratuitous_arp(peer(11).vip)).unwrap())
+            .unwrap();
+        assert_eq!(channel.receive().unwrap(), b"confirmed");
+    }
+
+    #[test]
+    fn force_relay_ignores_direct_candidates_and_only_requests_a_relay() {
+        let (coord, mut remote) = coordinator();
+        let direct = TcpListener::bind("127.0.0.1:0").unwrap();
+        direct.set_nonblocking(true).unwrap();
+        candidates(&mut remote, &[direct.local_addr().unwrap()]);
+        let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        udp.set_nonblocking(true).unwrap();
+        remote
+            .send(
+                &[
+                    u32v(SERVER_OP, 29),
+                    u64v(0x020001c1, CID),
+                    tlv(
+                        0x127c,
+                        &[
+                            u32v(0x0100020a, 123),
+                            tlv(
+                                0x127d,
+                                &[
+                                    textv(0x030001c2, "127.0.0.1").unwrap(),
+                                    u32v(0x010001c3, udp.local_addr().unwrap().port() as u32),
+                                ]
+                                .concat(),
+                            ),
+                        ]
+                        .concat(),
+                    ),
+                ]
+                .concat(),
+            )
+            .unwrap();
+        let relay = TcpListener::bind("127.0.0.1:0").unwrap();
+        relay_offer(&mut remote, relay.local_addr().unwrap().port());
+        let server = responder(relay, TransportPath::Relay);
+        let started = Instant::now();
+        let mut report = TransportReport::default();
+        let channel = PeerChannel::negotiate(
+            &identity(),
+            peer(11).vip,
+            peer(42),
+            &ReportDirectory::disabled(),
+            Duration::from_secs(5),
+            None,
+            coord,
+            true,
+            &mut report,
+        )
+        .unwrap();
+        assert!(started.elapsed() < DIRECT_HEAD_START);
+        assert_eq!(channel.transport.path, Some(TransportPath::Relay));
+        assert!(report.tcp_candidates.is_empty() && report.udp_candidates.is_empty());
+        assert!(report.attempts.iter().all(|attempt| attempt["phase"]
+            .as_str()
+            .is_none_or(|phase| !phase.contains("direct"))));
+        let request = remote.receive().unwrap();
+        assert_eq!(
+            request,
+            request_relay(CID),
+            "no direct candidate requests or UDP advertisements"
+        );
+        assert!(direct.accept().is_err(), "no direct TCP attempts");
+        assert!(
+            udp.recv_from(&mut [0; 2048]).is_err(),
+            "no direct UDP attempts"
+        );
+        exchange(channel);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn four_tcp_lanes_bypass_three_stalled_candidates_before_relay_discovery() {
+        let (coord, mut remote) = coordinator();
+        let stalled: Vec<_> = (0..3).map(|_| stalled_listener()).collect();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoints: Vec<_> = stalled
+            .iter()
+            .map(|(address, _, _)| *address)
+            .chain([listener.local_addr().unwrap()])
+            .collect();
+        candidates(&mut remote, &endpoints);
+        let server = responder(listener, TransportPath::DirectTcp);
+        let mut report = TransportReport::default();
+        let started = Instant::now();
+        let channel = PeerChannel::negotiate(
+            &identity(),
+            peer(11).vip,
+            peer(42),
+            &ReportDirectory::disabled(),
+            Duration::from_secs(5),
+            None,
+            coord,
+            false,
+            &mut report,
+        )
+        .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(1500),
+            "ready TCP waited for unrelated setup"
+        );
+        assert_eq!(channel.transport.path, Some(TransportPath::DirectTcp));
+        exchange(channel);
+        for (_, entered, loser) in stalled {
+            entered.recv_timeout(Duration::from_secs(1)).unwrap();
+            loser.join().unwrap();
+        }
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn first_tcp_wave_includes_public_and_lan_addresses_of_both_families() {
+        let candidates: Vec<_> = [
+            "198.51.100.1:1",
+            "198.51.100.2:2",
+            "198.51.100.3:3",
+            "[2001:db8::1]:4",
+            "10.0.0.1:5",
+            "[fd00::1]:6",
+        ]
+        .into_iter()
+        .map(|address| TcpCandidate {
+            endpoint: address.parse().unwrap(),
+            server_flag: false,
+        })
+        .collect();
+        let ordered = order_tcp_candidates(&candidates);
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|candidate| candidate.endpoint.port())
+                .collect::<Vec<_>>(),
+            [1, 4, 5, 6, 2, 3]
+        );
+        assert_eq!(ordered.len(), candidates.len());
+    }
+
+    #[test]
+    fn relay_authenticates_while_direct_handshake_and_candidate_discovery_are_stalled() {
+        let (coord, mut remote) = coordinator();
+        let (stalled, entered, loser) = stalled_listener();
+        candidates(&mut remote, &[stalled]);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        relay_offer(&mut remote, listener.local_addr().unwrap().port());
+        let server = responder(listener, TransportPath::Relay);
+        let mut report = TransportReport::default();
+        let started = Instant::now();
+        let channel = PeerChannel::negotiate(
+            &identity(),
+            peer(11).vip,
+            peer(42),
+            &ReportDirectory::disabled(),
+            Duration::from_secs(10),
+            None,
+            coord,
+            false,
+            &mut report,
+        )
+        .unwrap();
+        assert!(
+            started.elapsed() >= DIRECT_HEAD_START && started.elapsed() < Duration::from_secs(6),
+            "relay must respect the direct head start but remain a bounded fallback"
+        );
+        assert_eq!(channel.transport.path, Some(TransportPath::Relay));
+        entered.recv_timeout(Duration::from_secs(1)).unwrap();
+        exchange(channel);
+        loser.join().unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn relay_waits_for_late_direct_candidates_but_has_a_finite_deadline() {
+        let now = Instant::now();
+        let offer = RelayOffer {
+            host: String::new(),
+            port: 1,
+            ticket: vec![],
+            received_at: now,
+        };
+        assert!(!offer.ready(now + Duration::from_secs(3), None, false));
+        assert!(offer.ready(now + Duration::from_secs(4), None, false));
+        let late_udp = now + Duration::from_secs(3);
+        assert!(!offer.ready(now + Duration::from_secs(6), Some(late_udp), false));
+        assert!(offer.ready(now + Duration::from_secs(7), Some(late_udp), false));
+        assert!(offer.ready(
+            now + Duration::from_secs(8),
+            Some(now + Duration::from_secs(7)),
+            false
+        ));
+        assert!(
+            offer.ready(now, None, true),
+            "exhausted direct paths need no extra wait"
+        );
+    }
+
+    #[test]
+    fn slow_direct_authentication_wins_over_a_ready_relay() {
+        let (coord, mut remote) = coordinator();
+        let direct = TcpListener::bind("127.0.0.1:0").unwrap();
+        candidates(&mut remote, &[direct.local_addr().unwrap()]);
+        let direct_server = thread::spawn(move || {
+            let socket = direct.accept().unwrap().0;
+            thread::sleep(Duration::from_millis(1200));
+            respond(socket, TransportPath::DirectTcp);
+        });
+        let relay = TcpListener::bind("127.0.0.1:0").unwrap();
+        relay_offer(&mut remote, relay.local_addr().unwrap().port());
+        let (prepared_tx, prepared_rx) = mpsc::channel();
+        let relay_server = thread::spawn(move || {
+            let mut stream =
+                Framed::from_socket(relay.accept().unwrap().0, Duration::from_secs(5), None)
+                    .unwrap();
+            let ticket = stream.receive(65536).unwrap();
+            assert_eq!(
+                field(&records(&ticket).unwrap(), 0x090001ca).unwrap(),
+                &[23; 256]
+            );
+            stream.send(&u32v(0x010001df, 2)).unwrap();
+            prepared_tx.send(()).unwrap();
+            // A paired relay cannot begin SH while the direct path still owns
+            // its head start. Winning direct setup must close the unused socket.
+            let error = stream.receive(65536).unwrap_err();
+            assert_eq!(error.to_string(), "remote endpoint closed the connection");
+        });
+        let channel = PeerChannel::negotiate(
+            &identity(),
+            peer(11).vip,
+            peer(42),
+            &ReportDirectory::disabled(),
+            Duration::from_secs(10),
+            None,
+            coord,
+            false,
+            &mut TransportReport::default(),
+        )
+        .unwrap();
+        let path = channel.transport.path;
+        exchange(channel);
+        prepared_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        relay_server.join().unwrap();
+        direct_server.join().unwrap();
+        assert_eq!(path, Some(TransportPath::DirectTcp));
+    }
+
+    #[test]
+    fn relay_pairing_runs_during_direct_head_start_without_early_peer_authentication() {
+        let (coord, mut remote) = coordinator();
+        let relay = TcpListener::bind("127.0.0.1:0").unwrap();
+        relay_offer(&mut remote, relay.local_addr().unwrap().port());
+        let (prepared_tx, prepared_rx) = mpsc::channel();
+        let started = Instant::now();
+        let server = thread::spawn(move || {
+            let mut stream =
+                Framed::from_socket(relay.accept().unwrap().0, Duration::from_secs(10), None)
+                    .unwrap();
+            stream.receive(65536).unwrap();
+            prepared_tx.send(started.elapsed()).unwrap();
+            thread::sleep(Duration::from_millis(1_500));
+            stream.send(&u32v(0x010001df, 2)).unwrap();
+            assert!(
+                !stream.ready(100).unwrap(),
+                "pairing alone must not start peer authentication"
+            );
+            respond_stream(stream, TransportPath::Relay);
+        });
+        let mut report = TransportReport::default();
+        let channel = PeerChannel::negotiate(
+            &identity(),
+            peer(11).vip,
+            peer(42),
+            &ReportDirectory::disabled(),
+            Duration::from_secs(10),
+            None,
+            coord,
+            false,
+            &mut report,
+        )
+        .unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            prepared_rx.recv().unwrap() < Duration::from_millis(1_000),
+            "relay preparation must not wait four seconds"
+        );
+        assert!(
+            elapsed >= DIRECT_HEAD_START && elapsed < Duration::from_millis(5_000),
+            "pairing latency should overlap the unchanged head start: {elapsed:?}"
+        );
+        assert_eq!(channel.transport.path, Some(TransportPath::Relay));
+        assert!(report.attempts.iter().any(
+            |attempt| attempt["phase"] == "relay_preparation" && attempt["result"] == "paired"
+        ));
+        exchange(channel);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn rejected_relay_preparation_does_not_interrupt_direct_authentication() {
+        let (coord, mut remote) = coordinator();
+        let direct = TcpListener::bind("127.0.0.1:0").unwrap();
+        candidates(&mut remote, &[direct.local_addr().unwrap()]);
+        let direct_server = thread::spawn(move || {
+            let socket = direct.accept().unwrap().0;
+            thread::sleep(Duration::from_millis(300));
+            respond(socket, TransportPath::DirectTcp);
+        });
+        let relay = TcpListener::bind("127.0.0.1:0").unwrap();
+        relay_offer(&mut remote, relay.local_addr().unwrap().port());
+        let relay_server = thread::spawn(move || {
+            let mut stream =
+                Framed::from_socket(relay.accept().unwrap().0, Duration::from_secs(5), None)
+                    .unwrap();
+            stream.receive(65536).unwrap();
+            stream.send(&u32v(0x010001df, 3)).unwrap();
+        });
+        let mut report = TransportReport::default();
+        let channel = PeerChannel::negotiate(
+            &identity(),
+            peer(11).vip,
+            peer(42),
+            &ReportDirectory::disabled(),
+            Duration::from_secs(5),
+            None,
+            coord,
+            false,
+            &mut report,
+        )
+        .unwrap();
+        assert_eq!(channel.transport.path, Some(TransportPath::DirectTcp));
+        assert!(report
+            .attempts
+            .iter()
+            .any(|attempt| attempt["phase"] == "relay_preparation"
+                && attempt["error"] == "relay ticket rejected"));
+        exchange(channel);
+        relay_server.join().unwrap();
+        direct_server.join().unwrap();
+    }
+
+    #[test]
+    fn cancelling_negotiation_closes_in_progress_transports() {
+        let (coord, mut remote) = coordinator();
+        let (stalled, entered, loser) = stalled_listener();
+        candidates(&mut remote, &[stalled]);
+        let relay = TcpListener::bind("127.0.0.1:0").unwrap();
+        relay_offer(&mut remote, relay.local_addr().unwrap().port());
+        let (preparing_tx, preparing_rx) = mpsc::channel();
+        let relay_worker = thread::spawn(move || {
+            let mut stream =
+                Framed::from_socket(relay.accept().unwrap().0, Duration::from_secs(5), None)
+                    .unwrap();
+            stream.receive(65536).unwrap();
+            preparing_tx.send(()).unwrap();
+            // Leave pairing incomplete: cancellation must also join preparation.
+            assert_eq!(
+                stream.receive(65536).unwrap_err().to_string(),
+                "remote endpoint closed the connection"
+            );
+        });
+        let stop = Arc::new(AtomicBool::new(false));
+        let signal = stop.clone();
+        let worker = thread::spawn(move || {
+            PeerChannel::negotiate(
+                &identity(),
+                peer(11).vip,
+                peer(42),
+                &ReportDirectory::disabled(),
+                Duration::from_secs(5),
+                Some(signal),
+                coord,
+                false,
+                &mut TransportReport::default(),
+            )
+        });
+        entered.recv_timeout(Duration::from_secs(2)).unwrap();
+        preparing_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let started = Instant::now();
+        stop.store(true, Ordering::Relaxed);
+        assert!(worker.join().unwrap().is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        loser.join().unwrap();
+        relay_worker.join().unwrap();
+    }
+
+    #[test]
+    fn incoming_direct_tcp_bypasses_partial_rendezvous_and_beats_prepared_relay() {
+        use crate::incoming::{Hub, Policy};
+        let relay = TcpListener::bind("127.0.0.1:0").unwrap();
+        let relay_port = relay.local_addr().unwrap().port();
+        let (prepared_tx, prepared_rx) = mpsc::channel();
+        let relay_worker = thread::spawn(move || {
+            let mut stream =
+                Framed::from_socket(relay.accept().unwrap().0, Duration::from_secs(5), None)
+                    .unwrap();
+            stream.receive(65536).unwrap();
+            stream.send(&u32v(0x010001df, 2)).unwrap();
+            prepared_tx.send(()).unwrap();
+            assert_eq!(
+                stream.receive(65536).unwrap_err().to_string(),
+                "remote endpoint closed the connection"
+            );
+        });
+        let (wire, advertisements) = mpsc::sync_channel(16);
+        // Select a local interface without sending any datagram. Production
+        // advertisements deliberately exclude loopback interface inventories.
+        let route = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        route.connect("192.0.2.1:9").unwrap();
+        #[cfg(target_os = "macos")]
+        let route_ip = crate::udp::test_physical_route_ip();
+        #[cfg(not(target_os = "macos"))]
+        let route_ip = route.local_addr().unwrap().ip();
+        let mut hub = Hub::new(route_ip, vec![], wire);
+        hub.ingest(
+            &[
+                u32v(SERVER_OP, 11),
+                u64v(0x020001c1, CID),
+                tlv(
+                    0x1235,
+                    &[u64v(0x020001e1, 11), tlv(0x0a0001cd, PASSWORD)].concat(),
+                ),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        let setup = hub.take(11, Policy::All).unwrap();
+        let incoming = thread::spawn(move || {
+            let mut channel = setup
+                .accept(
+                    42,
+                    peer(42).vip,
+                    peer(11),
+                    &ReportDirectory::disabled(),
+                    Arc::new(AtomicBool::new(false)),
+                )
+                .unwrap();
+            assert_eq!(channel.transport.path, Some(TransportPath::DirectTcp));
+            let packet = channel.receive().unwrap();
+            assert!(matches!(
+                tunnel::decode(&packet).unwrap(),
+                tunnel::Packet::Frames(_)
+            ));
+            channel.send(b"confirmed").unwrap();
+        });
+        let advertisement = advertisements.recv_timeout(Duration::from_secs(2)).unwrap();
+        let fields = records(&advertisement).unwrap();
+        let body = field(&fields, 0x1230).unwrap();
+        let candidate_record =
+            [u32v(SERVER_OP, 6), u64v(0x020001c1, CID), tlv(0x1236, body)].concat();
+        let endpoints = tcp_candidates(&candidate_record, CID).unwrap();
+        let endpoint = endpoints
+            .iter()
+            .find(|candidate| candidate.endpoint.is_ipv4())
+            .unwrap()
+            .endpoint;
+        hub.ingest(
+            &[
+                u32v(SERVER_OP, 23),
+                u64v(0x020001c1, CID),
+                tlv(
+                    0x123f,
+                    &[
+                        textv(0x030001cb, "127.0.0.1").unwrap(),
+                        u32v(0x010001cc, relay_port as u32),
+                        tlv(0x090001ca, &[23; 256]),
+                    ]
+                    .concat(),
+                ),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        prepared_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let mut stalled = TcpStream::connect(endpoint).unwrap();
+        stalled.write_all(&[0]).unwrap();
+        thread::sleep(Duration::from_millis(50));
+        let started = Instant::now();
+        let mut stream = Framed::connect(
+            &endpoint.ip().to_string(),
+            endpoint.port(),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        stream.peer_rendezvous(11, CID, 17).unwrap();
+        let channel = PeerChannel::authenticate_peer(
+            PeerStream::Tcp(stream),
+            TransportPath::DirectTcp,
+            PASSWORD,
+            &identity(),
+            peer(11).vip,
+            peer(42),
+            &ReportDirectory::disabled(),
+        )
+        .unwrap();
+        exchange(channel);
+        incoming.join().unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(1_500),
+            "an incomplete rendezvous must not hide a healthy direct candidate"
+        );
+        relay_worker.join().unwrap();
+        stalled
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        assert_eq!(
+            stalled.read(&mut [0]).unwrap(),
+            0,
+            "the losing rendezvous socket must close"
+        );
+    }
+
+    #[test]
+    fn both_connection_roles_prepare_relay_and_exchange_authenticated_traffic_after_grace() {
+        use crate::incoming::{Hub, Policy};
+        let relay = TcpListener::bind("127.0.0.1:0").unwrap();
+        let relay_port = relay.local_addr().unwrap().port();
+        let (paired_tx, paired_rx) = mpsc::channel();
+        let started = Instant::now();
+        let relay_server = thread::spawn(move || {
+            let mut a =
+                Framed::from_socket(relay.accept().unwrap().0, Duration::from_secs(10), None)
+                    .unwrap();
+            let mut b =
+                Framed::from_socket(relay.accept().unwrap().0, Duration::from_secs(10), None)
+                    .unwrap();
+            for stream in [&mut a, &mut b] {
+                let ticket = stream.receive(65536).unwrap();
+                assert_eq!(
+                    field(&records(&ticket).unwrap(), 0x090001ca).unwrap(),
+                    &[23; 256]
+                );
+                stream.send(&u32v(0x010001df, 2)).unwrap();
+            }
+            paired_tx.send(started.elapsed()).unwrap();
+            let (mut a_read, mut b_read) = (a.socket, b.socket);
+            // Framed reads temporarily use 200 ms cancellation slices. The
+            // transparent relay must wait through the full direct head start.
+            a_read
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            b_read
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let (mut a_write, mut b_write) =
+                (a_read.try_clone().unwrap(), b_read.try_clone().unwrap());
+            let forward = thread::spawn(move || {
+                let result = std::io::copy(&mut a_read, &mut b_write);
+                let _ = b_write.shutdown(std::net::Shutdown::Write);
+                result
+            });
+            let result = std::io::copy(&mut b_read, &mut a_write);
+            let _ = a_write.shutdown(std::net::Shutdown::Write);
+            assert!(result.unwrap() > 0);
+            assert!(forward.join().unwrap().unwrap() > 0);
+        });
+        let (wire, _advertisements) = mpsc::sync_channel(16);
+        let route = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        route.connect("192.0.2.1:9").unwrap();
+        let mut hub = Hub::new(route.local_addr().unwrap().ip(), vec![], wire);
+        hub.ingest(
+            &[
+                u32v(SERVER_OP, 11),
+                u64v(0x020001c1, CID),
+                tlv(
+                    0x1235,
+                    &[u64v(0x020001e1, 11), tlv(0x0a0001cd, PASSWORD)].concat(),
+                ),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        let setup = hub.take(11, Policy::All).unwrap();
+        hub.ingest(&relay_record(relay_port)).unwrap();
+        let incoming = thread::spawn(move || {
+            let mut channel = setup
+                .accept(
+                    42,
+                    peer(42).vip,
+                    peer(11),
+                    &ReportDirectory::disabled(),
+                    Arc::new(AtomicBool::new(false)),
+                )
+                .unwrap();
+            assert_eq!(channel.transport.path, Some(TransportPath::Relay));
+            let packet = channel.receive().unwrap();
+            assert!(matches!(
+                tunnel::decode(&packet).unwrap(),
+                tunnel::Packet::Frames(_)
+            ));
+            channel.send(b"confirmed").unwrap();
+        });
+        let (coord, mut remote) = coordinator();
+        relay_offer(&mut remote, relay_port);
+        let channel = PeerChannel::negotiate(
+            &identity(),
+            peer(11).vip,
+            peer(42),
+            &ReportDirectory::disabled(),
+            Duration::from_secs(10),
+            None,
+            coord,
+            false,
+            &mut TransportReport::default(),
+        )
+        .unwrap();
+        assert_eq!(channel.transport.path, Some(TransportPath::Relay));
+        assert!(
+            paired_rx.recv().unwrap() < Duration::from_millis(1_000),
+            "both roles should pair during the direct head start"
+        );
+        assert!(started.elapsed() >= DIRECT_HEAD_START);
+        exchange(channel);
+        incoming.join().unwrap();
+        relay_server.join().unwrap();
+    }
+}

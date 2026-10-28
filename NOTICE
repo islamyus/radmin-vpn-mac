@@ -1,0 +1,27 @@
+Radmin VPN Mac is an independent native macOS interoperability project.
+It is not affiliated with or endorsed by Famatech Corp.
+Project license: GPL-3.0-only (see LICENSE).
+
+Native protocol engine: OpenRad
+https://github.com/gringoestrangeiro/openrad
+Upstream revision: 47eb54f6b051aadc37260d405681b2111b50b7cc
+Copyright (c) 2026 estrangeiro
+Copyright (c) 2026 asimplestray
+OpenRad's MIT license is preserved in vendor/openrad/LICENSE and distributed
+as OpenRad-LICENSE in the application. See vendor/openrad/UPSTREAM.json and
+vendor/openrad/LOCAL_CHANGES.md for the macOS changes. The original upstream
+files retain their original notices; the macOS adapter is GPL-3.0-only.
+
+Adapter research reference: radmin-vpn-linux
+https://github.com/baptisterajaut/radmin-vpn-linux
+Revision studied: 754389524327ad8e9ec0eb7de8348a74cacfd1f6
+Authors: baptisterajaut and contributors; license GPL-3.0.
+The reference checkout and discontinued compatibility experiments are not
+part of the public source package or application.
+
+The application contains native Swift, C, and Rust code. It does not contain
+Wine, a Windows runtime, proprietary DLLs, Windows services or Radmin installers.
+Radmin VPN is proprietary software and a trademark of Famatech Corp.
+
+Dependency license texts and Rust standard-library notices are collected from
+the locked dependency graph into THIRD-PARTY-NOTICES.txt in packaged builds.

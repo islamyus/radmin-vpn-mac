@@ -1,0 +1,302 @@
+# Changelog
+
+## 2.0.1 — 2026-10-15
+
+A maintenance release with lighter desktop status updates, Android TUN reader
+hardening, faster Python packet handling and native-Windows packaging fixes.
+See the [release notes](docs/releases/2.0.1.md) and
+[file-by-file inventory](docs/releases/2.0.1-changes.md). Windows remains experimental.
+
+- The engine publishes state snapshots, and the desktop polls the shared service, every 500 ms instead of 250 ms, halving full-roster copies on large networks. Packets, keepalives and RTT probes are unaffected; peer status and traffic counters can take up to about a second to appear. Identical adjacent phase notices are coalesced without reordering phases or operation results, and the UI drains notices without an extra allocation.
+- The wgpu renderer prefers an integrated GPU over a discrete one when both can present to the window, so the VPN window does not wake a discrete GPU. Linux still starts with OpenGL by default.
+- Android: the TUN reader stops on poll errors and EOF instead of spinning, retries spurious zero-byte reads, and marks the interface as failed (retryable from the app) only when it still owns the current TUN, so an older reader can never close a newer interface.
+- Python: the Internet checksum sums 16-bit words through a `memoryview`, local API delivery skips IPv4/UDP parsing when no subscriber needs it, and the packet builders reject malformed MAC lengths, oversized IPv4 payloads, non-integer protocols and ports.
+- Windows packaging: the icon resource path drops the `\\?\` verbatim prefix (keeping UNC shares) for `windres` on Windows hosts, NSIS payload paths use Windows separators, and the TAP-Windows6 corresponding source is exported with pinned line-ending settings so Linux and Windows hosts produce the same audited archive. Packages now include the 1.5.0 and 2.0.0 release notes in their release history.
+- Validation: the Linux workspace suites, Linux/Windows Clippy, Windows test compilation, Android unit tests (including the new TUN poll tests), Python suites and the Wine installer-flow regression pass. Native Windows TAP/UAC/interoperability and on-device Android behavior remain unmeasured.
+
+## 2.0.0 — 2026-10-14
+
+OpenRad becomes a monorepo: the Android Kotlin client and the Python SDK join
+the Rust desktop and CLI on one shared wire format. See the
+[release notes](docs/releases/2.0.0.md) and
+[file-by-file inventory](docs/releases/2.0.0-changes.md). Windows remains experimental.
+
+- Import `clients/android/` (Kotlin port, beta, TCP plus Wi-Fi-only UDP, packet path about 1.5x faster with byte-identical wire output) and `clients/python/` (stdlib-only SDK, pip-installable from git). The Rust `tests/fixtures/` vectors and `locales/messages.json` stay canonical; `python3 scripts/check-sync.py` and CI fail when the client mirrors diverge. The release ships a signed Android APK (`com.openrad.mobile`).
+- The Windows installer asks before touching a running OpenRad, stops it gracefully with its own bundled `openrad stop` (never an executable already in the install folder), closes the desktop window, and offers Retry/Cancel while an installed file is still in use; it never force-terminates processes. The setup worker names the mismatching file on integrity failures.
+- UDP parsers return errors on truncated or overflowing datagrams, and ENET commands shorter than their 4-byte header are rejected before transmission. All new errors are translated.
+- Android: the TUN reader no longer leaks a thread on every interface rebuild, and a node rename restarts the engine inside the VPN service so the service cannot stop itself underneath the new session. `VpnService` closes the TUN off the main thread.
+- Normalize branding on the canonical `assets/logo.svg` (PNG/ICO derivatives, redrawn desktop logo, window/executable/installer icons). Linux archives add `org.openrad.desktop.desktop`, matching the window app_id, and `install-desktop-entry.sh` for a per-user menu entry with an absolute launcher path.
+- Validation: the Linux workspace suites, Linux/Windows Clippy, Windows test compilation, Android unit tests, Python suites and a Wine installer-flow regression pass. Native Windows TAP/UAC/interoperability and live throughput remain unmeasured.
+
+## 1.5.0 — 2026-10-12
+
+Fresh Linux and Windows builds include every change since v1.4.0. See the
+[release notes](docs/releases/1.5.0.md) and
+[file-by-file inventory](docs/releases/1.5.0-changes.md). Windows remains experimental.
+
+- Add an optional per-peer transport address display in the desktop, off by default. Enable **Settings → Peer IP** to show `Peer IP: {endpoint}` for direct channels and `Relay IP: {ip}` for relay channels, only while `Connected`. The service publishes the authenticated channel endpoint through snapshots; the UI remeasures rows when it changes and retains language/scale/layout invalidation.
+- Speed up the packet path without changing wire formats: sliced 8-byte CRC, pipelined 32-block CBC receive, word-wise record authentication, cached handshake prime, 8 KiB TCP/relay read-ahead with a single read-timeout setup, in-place membership updates and single-pass display-name decoding. Document loopback microbenchmarks and their limits in the performance guide; live throughput remains unmeasured.
+- Contain faults and reduce stalls: treat a full UDP send buffer as 10 ms congestion retry with best-effort punches/ACKs instead of failing the channel, bound sustained congestion to a 35 s timeout, validate member updates before applying peers or roles, convert engine/control/peer/setup panics into errors, recover poisoned locks, split service/config locking, and use nonblocking Linux TAP reads.
+- Translate new controls and errors in all four languages, update desktop/architecture/performance guides, and package two synthetic Portuguese screenshots.
+- Validate 329 default Linux tests, formatting and Linux/Windows Clippy, Windows test compilation, and inspected CPU-rendered screenshots. Synthetic benchmarks are loopback-only; native Windows TAP/UAC/interoperability and live network measurements remain outstanding.
+
+## 1.4.0 — 2026-10-04
+
+Fresh Linux and Windows builds include every change since v1.3.0. See the
+[release notes](docs/releases/1.4.0.md) and
+[file-by-file inventory](docs/releases/1.4.0-changes.md). Windows remains experimental.
+
+- Add multiple outgoing broadcast recipients and an exclusion mode in CLI and desktop, preserving existing single-peer preferences and sharing changes through the service without reconnecting. Compile destination lists on policy/channel changes so broadcast fan-out performs no per-packet RID lookups or exclusion-list scans; retain normal incoming, unicast and multicast behavior.
+
+- Add virtualized multi-peer selection, include/exclude modes and offline saved-RID removal to desktop Settings. Support multiple CLI targets and `--exclude`, with atomic validation and persistence, bounded selections and compatibility with existing single-peer settings.
+- Translate controls and errors in all four languages, update CLI/desktop/architecture/performance guides, and package a synthetic Portuguese screenshot. Validate 303 default Linux tests, formatting and Linux/Windows Clippy, Windows test compilation, and eight inspected CPU-rendered settings screenshots. Synthetic routing benchmarks retain all-peer fan-out within measured variation; live throughput and latency remain unmeasured.
+
+## 1.3.0 — 2026-10-04
+
+Fresh Linux and Windows builds include every change since the refreshed 1.2.0
+source. See the [release notes](docs/releases/1.3.0.md) and
+[file-by-file inventory](docs/releases/1.3.0-changes.md). Windows remains experimental.
+
+- Increase initial peer setup capacity from 64 outgoing / 80 total handshakes to 96 / 128, preserving reserved incoming capacity and existing retry pacing. Run four outgoing TCP candidate lanes and diversify their first wave across address families and public/LAN paths without reducing candidate deadlines.
+- Prepare relay TCP connections and ticket pairing alongside direct attempts on both roles. Keep relay peer authentication behind the existing four-second direct preference and eight-second maximum extension; preparation alone cannot win or forward traffic. Own, cancel and join unused preparation workers, and record preparation timing separately.
+- Validate up to four incoming TCP rendezvous preambles concurrently within the existing eight-socket admission bound, preserving serialized TCP service authentication and full RID/CID validation.
+- Make Windows TCP connection attempts nonblocking and cancellable; queue shared peer-start thread-allocation failures for recovery instead of panicking. Add synthetic regressions for stalled candidates, incoming preambles, direct preference over a prepared relay, overlapped pairing and cancellation. Native Windows TAP/UAC/interoperability validation remains outstanding.
+- Validate with 300 default Linux workspace tests, formatting and Clippy for Linux/Windows, Windows test compilation and 43 selected Windows Rust tests in an isolated Wine prefix. Native platform networking and public-network connection-time measurements remain outstanding.
+
+## 1.2.0 — 2026-10-04
+
+Fresh Linux and Windows builds include every change since v1.1.0. See the
+[release notes](docs/releases/1.2.0.md) and
+[file-by-file inventory](docs/releases/1.2.0-changes.md). Windows remains experimental.
+
+- Add a saved outgoing broadcast recipient shared by desktop and CLI. Select by RID, exact device name or VPN IP in Settings or with `openrad broadcast-peer`; restore all eligible recipients with `--all` or `0.0.0.0`. Apply changes without reconnecting, preserve incoming broadcasts and unicast/multicast routing, reject ambiguous names/IPs, and avoid redirecting broadcasts to other peers when the selected recipient is unavailable.
+- Move outbound routing and address announcements to one bounded FIFO forwarding worker, keeping TAP I/O and session orchestration responsive. Cache authenticated eligible queue endpoints with IP/RID indexes, preserve cancellation and dispatch ordering, and reject inbound frames from replaced channel generations before TAP delivery.
+- Parse peer setup records on the attachment worker and move their owned buffers through setup mailboxes. Index incoming offers by connection and peer IDs while retaining bounded admission, deduplication, expiry and cleanup.
+- Reduce repeated frontend work with linear catalog-page deduplication and a joined-network name index. Free superseded snapshots after releasing the notice-queue lock while preserving phase and operation barriers. Avoid repeated atomic exchanges for already-pending wake notifications.
+
+- Fix Windows TAP error 995 after asynchronous setup: issue the first overlapped read on the persistent engine thread after the setup worker exits, and retain buffer ownership through cancellation/completion. Add a headless named-pipe handoff/read/rearm regression.
+- Recover official Radmin adapter conflicts with readable, bounded failure details over a protected temporary named pipe. The Windows asset refresh below strengthens termination and adds installation preflight and fallback methods.
+- Translate broadcast controls and service errors in English, Portuguese, Russian and Vietnamese. Expand the CLI reference and add a complete Brazilian Portuguese guide, synthetic settings screenshot, architecture/performance notes and release inventory. Package the new guides and screenshot for both platforms.
+- Validate with 293 default Linux tests, five CPU-rendering tests and inspected synthetic screenshots, formatting and Clippy for both targets, Windows test compilation, 38 synthetic PowerShell cases, eight isolated installer-flow cases and twelve selected Windows Rust tests under Wine. Publish fresh Debian 12/Rust 1.95 Linux and Rust 1.98/MinGW Windows builds with dependency notices, driver source, build/import metadata and SHA-256 checksums; native Windows TAP/UAC and real Radmin interoperability remain unverified.
+
+### Windows asset refresh — 2026-10-04
+
+- Prepare Radmin before the installer creates/repairs TAP or opens an already-ready installation, and recheck in direct configure calls. Abort before installation changes when preparation fails.
+- Force-terminate `RvRvpnGui.exe` and `RvControlSvc.exe` even after a refused service stop. Try administrator, SYSTEM and final administrator contexts, with bounded children, CIM/sc service-stop requests and an exact-image taskkill fallback.
+- Add verified GUID-bound NetAdapter, CIM, netsh, PnP and PnPUtil disable paths; check stable process/adapter state and retry immediate restarts. Recognize numbered official driver descriptions and identify the exact interface/address in remaining conflicts.
+- Pass the larger embedded PowerShell program through private stdin to avoid Windows' command-line limit; retain protected tool/module lookup, encoded SYSTEM workers, bounded diagnostics and task/pipe cleanup.
+- Refresh only the Windows release assets and checksum file, retaining the original Linux archive and `v1.2.0` tag. Record the post-tag Windows source commit in package metadata and the [refresh guide](docs/releases/1.2.0-windows-refresh.md). Validate 295 default Linux tests, 53 synthetic PowerShell cases and nine isolated installer-flow cases; native Windows Radmin/TAP/UAC validation remains outstanding.
+
+## 1.1.0 — 2026-10-02
+
+Fresh Linux and Windows builds include every change since v1.0.0. See the
+[release notes](docs/releases/1.1.0.md) and
+[file-by-file inventory](docs/releases/1.1.0-changes.md). Windows remains experimental.
+
+- Fix Linux TAP authorization from the detached shared service: fall back from noninteractive sudo to the session Polkit permission dialog instead of relying on a terminal-bound sudo timestamp. Resolve relative helper paths before elevation and keep administrator passwords outside OpenRad.
+- Run interface setup in a single worker so status, stop, and peer forwarding remain responsive during authorization. Bound dialogs to 120 seconds and elevated setup to 15 seconds, cancel pending Linux setup on Disconnect/Stop, ignore duplicate pending retries, and distinguish authorization refusal from actual setup failure before retrying. Update four-language guidance and add synthetic descriptor/fallback/cancellation/timeout regressions.
+- Limit local service clients to 32 workers and 128 queued commands. Enforce aggregate Unix read/write deadlines, reject oversized outgoing requests, and avoid exhausting Windows named-pipe instances under load.
+- Resolve curl and elevated PowerShell from protected system paths. Restrict PowerShell module lookup to system modules and embed the adapter configuration script in the setup helper, validating identifiers before executing it.
+- Reject loopback peer candidates on remote control-server routes and validate IPv4-mapped IPv6 candidates as IPv4. Preserve private LAN candidates and explicitly local control-server deployments.
+- Replace terminal control characters in remote display names while retaining Unicode and truncated-emoji tolerance; reject control characters in strict protocol text.
+- Read identities, passwords, settings, public moduli, and installer records with bounded regular-file reads. Reject FIFOs without waiting for a writer and retain broken/corrupt preferences for repair.
+- Keep private network passwords in zeroizing types across local IPC and clear serialized requests and Windows I/O buffers after use, preserving overlapped buffer ownership through completion/cancellation.
+- Refuse automatic identity registration when a saved credential-store identity cannot be ruled out because the store is locked/unavailable. Keep incomplete private profiles and broken identity links on their original storage path instead of treating them as fresh profiles; retain explicit private-file identity imports without requiring a credential store.
+
+- Validate with 279 default Linux tests, four offscreen rendering tests, formatting and Clippy for both targets, Windows test compilation, 30 mocked PowerShell cases, eight isolated Wine installer-flow cases, and two selected Windows I/O/security tests under Wine. Build fresh Debian 12/Rust 1.95 Linux and Rust 1.98/MinGW Windows binaries; native privileged Linux/Polkit and native Windows TAP/UAC validation remain outstanding.
+
+## 1.0.0 — 2026-10-01
+
+This release includes all local changes since remote `main` at
+`8d793b44` (v0.9.5), with fresh Linux and Windows binaries. The
+[file-by-file inventory](docs/releases/1.0.0-changes.md) accounts for every
+changed and added file; [release notes](docs/releases/1.0.0.md) document upgrading,
+packages, checks, and limitations.
+
+### Shared desktop and CLI service
+
+- Move the per-user daemon into the shared library. Both frontends attach to one engine, identity, membership roster, peer set, and TAP session per profile; either frontend may start first. Desktop status polling and commands run off the UI thread, and closing the desktop leaves the service running. Desktop Disconnect and CLI Stop stop the shared session.
+- Resolve both frontends to the same default directory, retaining an existing desktop profile when the canonical CLI profile has not been initialized. Keep existing identities in their credential store or private file. Reject initialization over a saved profile, stored identity, or running service, and prevent conflicting identity imports.
+- Serialize simultaneous service launches with a startup lock; coordinate service startup and identity changes with separate profile/service locks. Persist service reconnect, relay, and traffic-allowlist preferences with atomic private writes. Status reports the process ID and service preferences; snapshots and transport paths support deserialization.
+- Add CLI `ping PEER_RID`, `rename NODE_NAME`, and `force-relay true|false`. Validate nonblank names, control characters, and protocol length; renaming keeps the RID, address, credentials, and memberships, reconnecting only to advertise the new name. Allow offline rename/policy changes and explicit restart after reconnect attempts are exhausted.
+- Apply saved reconnect enablement, 1–10 retry attempts, and 1–30 second base delay in the service, doubling delays to a five-minute cap. Relay or traffic-policy changes cancel and finish existing workers before restarting.
+- Bound local requests with aggregate deadlines, including nonblocking Linux Unix-socket connects when the listen backlog is full, incremental bounded reply reads, and Windows named-pipe connection/message deadlines. Recover a stale Unix socket only while holding the service lock; refuse to delete a non-socket file.
+
+### Desktop networks, search, and layout
+
+- Add persistent favorites for public and private networks. Pin favorites in discovery, the sidebar, and joined-network selectors; sort favorite ties by member count and then name. Preserve search filters, server order for non-favorites, and roster/role count fallbacks.
+- Add an Auto join page with public/private selections, exact-name entry, selecting already joined networks, clearing selections, and per-network password fields. Validate all required passwords before submission, skip existing/pending memberships, and show independent joining, queued, success, approval, failure, or interrupted results.
+- Save, update, load, and delete up to 32 named configurations containing up to 128 networks each. Persist network names/access types/favorites separately in a bounded, validated, atomically written private `network-preferences.json`; keep corrupt data available for repair. Favorites and configurations survive restarts and identity replacement. Passwords stay in zeroized memory, are cleared on loading/identity changes, and are never saved; loading or launching does not submit joins automatically.
+- Pace overlapping joins at least 50 ms apart and correlate each result with its row. A refusal does not cancel other joins. Interrupt queued work on disconnect, identity change, or frontend close; already submitted requests may still take effect remotely.
+- Debounce live public-network searches for 300 ms, browse when discovery opens, keep typing enabled during requests, filter visible results immediately, discard stale query replies/failures, and retain pagination for the current query.
+- Replace the eight-network sidebar limit with a scrollable list and reserved device/interface/version footer. Make the sidebar resizable and clamp it to smaller windows. Scroll joined-network selectors horizontally, truncate long labels with full-name hover text, center the connection-card icon/title/caption, and keep connection actions and timing readable at narrow widths and translated scales.
+- Cache peer names, normalized filters, formatted addresses, selected/sorted rows, network membership counts, favorites, public results, and Auto join ordering. Reuse cached work for traffic-only snapshots. Measure peer row heights and reserve offscreen space without rebuilding controls; invalidate rows for metadata, role, ping, language, scale, style, width, or display-setting changes, keeping open menus active.
+
+### Peer RTT, relay policy, and release notices
+
+- Measure peer RTT with correlated authenticated tunnel keepalives and distinct sequences/request tokens. Keep normal forwarding active, accept only the intended reply, and expire probes after 3000 ms. Show translated RTT, pending, and failure states per peer, with a frontend deadline protecting against stalled control requests or stale replies. No ICMP privileges are needed.
+- Enforce relay-only policy for outgoing and incoming channels: suppress direct TCP/UDP requests, advertisements, mapping discovery, listeners, and attempts, and use relay-only incoming setup. Save the policy through either frontend and expose it in snapshots/settings.
+- Check GitHub's latest stable release at launch and hourly using semantic version precedence. Ignore drafts/prereleases/older versions and reject untrusted release links. Use the system curl client with HTTPS-only redirects, certificate verification, five-second connection/15-second transfer limits, and a 1 MiB response cap; hide its console on Windows. Keep a discovered notice through navigation, reconnects, and failed checks until explicitly dismissed for that launch.
+
+### Provisioning and identity reset
+
+- Make DNS waits cancellable and bounded and attempt resolved TCP addresses within the connection budget. Retry transient connection/authentication-transport failures before registration up to three times per server with one-/two-second delays and a 90-second aggregate provisioning budget; preserve bounded redirects. Fail authentication/protocol rejection immediately, and never automatically resend registration after an ambiguous lost response.
+- Cancel queued connect work before reset, acquire the profile lock without indefinite waiting, and retry service shutdown for up to ten seconds before obtaining exclusive stopped-service ownership. Keep old service status from hiding a reset failure behind Connecting.
+- Publish provisioning/redirect/retry/registration/save progress in the UI and retained activity. Retry replacement storage up to three times, preserve the old identity until saving succeeds, retain an issued unsaved replacement for storage-only retries, and finish a successful reset disconnected. Protect pending replacements during close handling and expose an identity-reset log-path action.
+- Record elapsed stages, attempts, full error chains, shutdown retries, and pending-save state in early desktop/CLI diagnostics while excluding credentials, keys, passwords, and packet contents.
+- Route concurrent private-network password replies using request IDs/authentication sequences. Retain compatibility with one legacy uncorrelated private join; reject ambiguity before applying a proof to multiple joins. Timed-out membership changes still force reattachment to reload authoritative membership.
+
+### Transport allocation and Unix resource limits
+
+- Cache the oldest unacknowledged UDP data sequence and next retry deadline, skip premature retransmission scans, capture one clock per due pass, and bypass reorder-map insertion for in-order delivery. Preserve wraparound, first-arrival precedence, checksum/ACK admission, 400 ms retries, and the 20-attempt limit.
+- Reassemble up to 128 fragments into one bounded payload allocation with indexed coverage metadata and a receipt bitmap. Avoid duplicate payload copies, validate gaps/overlaps/total length before delivery, move the completed buffer, and retain unacknowledged completed data while reorder admission is full.
+- Validate all Ethernet envelopes in an incoming decrypted record before delivering any frame. Move single-frame buffers and share multi-frame buffers across owned frame views in the runtime and diagnostic client, preserving lengths, offload rejection, keepalive parsing, and bounded queues. A queued frame retains its containing record until consumed.
+- Batch sent-byte/frame/drop counter publication, including successful sends before later I/O failure. Borrow eligible membership records/IDs, reuse existing peer metadata allocations, serialize shared immutable service snapshots outside the state lock, and move desktop JSON subtrees into parsers instead of cloning them.
+- Translate Windows Ethernet/ARP MAC fields directly in the persistent overlapped-write buffer. Validate frame bounds before submission, issue no write after a failed transform, and preserve kernel-buffer ownership through completion/cancellation.
+- Raise the Unix soft open-file limit to at least 8192 at desktop/CLI startup, capped by the unchanged hard limit. Preserve higher inherited values, pass the limit to the service, and log restrictions/errors without preventing startup or requiring sudo.
+
+### Localization, tests, documentation, and distribution
+
+- Add 100 complete English/Portuguese/Russian/Vietnamese catalog entries for the new UI, commands, validation, provisioning, IPC, and release errors. Extend catalog audits to release/HTTP modules and recognize intentionally English diagnostic records.
+- Add regressions for shared-session startup in either order/concurrently, offline rename and preserved secrets, preference persistence, aggregate IPC/backlog deadlines, inherited descriptor limits, encrypted RTT correlation/timeouts, relay-only incoming/outgoing behavior, overlapping public/private joins, refusal isolation/legacy ambiguity, provisioning retry safety, reset cancellation/storage/shutdown/stale sockets, owned tunnel frames, UDP window/reassembly/order/deadlines, counters after errors, JSON ownership, cached layouts, favorites/configurations, live search, and release dismissal. Add a Windows transformed-write test using a temporary file.
+- Extend offscreen software rendering into a reusable helper and add synthetic feature, many-network, and identity-reset screenshots. Update all six platform/usage/architecture/performance guides, README, and repository guidelines; ignore local network/service preference and lock files. Restore changelog history for 0.1.0–0.5.0 from the published releases.
+- Synchronize both workspace package versions and lockfile at 1.0.0; add library keyring and semver dependencies. Include complete release/change guides and five public synthetic screenshots in Linux, Windows portable, and installer package allowlists; preserve root Windows guide/validation/Credits links and include the MIT license beside ZIP documentation. Publish fresh Linux and Windows archives, offline setup, dependency/standard-library notices, build/import provenance, corresponding signed-driver source/licenses, and SHA-256 checksums.
+- Validation and platform limitations are recorded in the [release notes](docs/releases/1.0.0.md). Existing performance numbers measure prior isolated changes; this release does not claim new end-to-end throughput, process-RSS, or native Windows driver measurements.
+
+## 0.9.5 — 2026-09-30
+
+### Windows Radmin VPN migration
+
+- Automatically recover when the enabled official Famatech Radmin VPN adapter occupies `26.0.0.0/8`: run a temporary local SYSTEM task, stop the `RvControlSvc.exe` service, terminate remaining `RvControlSvc.exe` processes, and disable only the selected official adapter.
+- Recheck active interfaces and continue the same desktop/CLI connection attempt. Bound recovery waits and remove the temporary task on success or failure. Keep unrelated VPN and stale OpenRad conflicts as errors; ignore addresses retained on administratively disabled interfaces.
+- Use an immutable embedded worker and Windows' built-in PowerShell/Task Scheduler. Keep the application's existing user profile, leave Radmin's startup setting unchanged, and document how to switch back.
+- Add synthetic Rust and PowerShell recovery regressions. Publish newly compiled Windows x64 applications/installer and reuse the exact 0.9.0 Linux archive; its Linux binaries continue reporting 0.9.0.
+
+## 0.9.0 — 2026-09-30
+
+### Experimental Windows support
+
+- Add Windows x64 desktop and persistent CLI support through the shared VPN engine and the official TAP-Windows6 Layer 2 driver. Use exclusive overlapped packet I/O, driver MAC translation, media controls and IP Helper session-address/route cleanup; preserve Linux's short-lived sudo helper.
+- Add an offline setup EXE with both applications, the unchanged signed TAP-Windows6 9.27.0 package, complete corresponding driver source/notices and shortcuts. Create/repair the dedicated adapter, reuse ready installations, open the desktop automatically, and support `--no-launch` for CLI use.
+- Fix adapter GUID comparisons for Windows NetAdapter string values and use device-specific SetupAPI driver keys instead of scanning protected unrelated registry keys. Persistent CLI control uses current-user protected named pipes and profiles.
+- Prefer native Direct3D 12 hardware rendering, then Windows WARP CPU rendering, then OpenGL. Preserve explicit renderer selection and prevent graphics retries after App creation from starting a second VPN backend. Use Windows' system FXC compiler without additional graphics DLL bundles.
+- Add early desktop/CLI/daemon diagnostics, a desktop child crash monitor, Rust panic backtraces, best-effort native exception module/address logging, backend credential-store checkpoints and individual TAP setup stages. Keep credentials and packet contents out of logs.
+- Add an explicit local SYSTEM diagnostic launcher with isolated profiles; verify the official Microsoft PsExec signature and present its license. Normal setup stays offline and ordinary administrator startup remains the default.
+- Windows support is experimental. It has been tested only on Windows 10 so far, where the tester reports it working perfectly in their setup. Windows 11 and more hardware/network combinations need testing and issue reports before stable Windows support in 1.0.0.
+
+### Four-language desktop and CLI
+
+- Add complete English, Portuguese, Russian and Vietnamese catalogs, automatic system-language detection, saved desktop language preferences and `--language` overrides for both binaries.
+- Translate dialogs, validation, peer/transport states, retained activity, command help and CLI output while preserving names, paths, protocol values and machine-readable JSON.
+- Embed Noto Sans for Cyrillic and Vietnamese accents; include the font's SIL Open Font License.
+
+### Documentation and releases
+
+- Publish separate Linux x86-64 and experimental Windows x64 packages, an offline Windows setup EXE, source/license notices and SHA-256 checksums.
+- Add native Linux and Windows build instructions to the README, Windows diagnostic/issue-report guidance for 1.0.0 and a macOS roadmap note: support is planned, but development has not started.
+- Record the tester's Windows 10 comparison on the same network with 76 peers: official Radmin VPN 176 MB GUI + 23 MB service (199 MB total), OpenRad 41 MB client; idle CPU 1–4% versus 0–3%. These are observations from that setup; further CPU/memory improvements are planned.
+
+## 0.8.0 — 2026-09-29
+
+### CPU and forwarding
+
+- Replaced repeated idle UDP polling and established peer queue checks with Linux socket/event notifications. Queued frames and cancellation wake workers immediately; keepalive, reliable UDP retransmission, and liveness deadlines remain enforced. The engine also waits for TAP and peer/control events, with external commands and cancellation checked within 50 ms.
+- Validate outbound Ethernet/IP/ARP headers once per frame and index eligible recipients by virtual IP for unicast and directed ARP. Duplicate IP bindings, RID order, authenticated MAC checks, traffic policy, and group forwarding rules are preserved.
+- Recalculate connection scheduling on state changes or every 50 ms, reuse candidate storage, traverse UDP retries directly, reserve command sizes, and encode ACK commands on the stack.
+
+### Memory and desktop
+
+- Reuse each peer's Ethernet envelope/encryption buffer and decrypt received records in their owned transport buffer. Preserve CBC chaining, padding, authentication trailers, and fixed ciphertext vectors. Check the reliable UDP send window before advancing the encryption chain.
+- Send Linux UDP headers and existing command buffers as one datagram with scatter/gather I/O, removing the concatenated packet allocation. Share immutable frames between diagnostic-client peer queues.
+- Borrow desktop peer views and cache sort keys instead of cloning peer data and repeatedly converting names. Coalesce consecutive queued state snapshots while retaining operation results and phase transitions in order.
+
+### Local measurements
+
+- For 120 idle UDP peers over 2 seconds, summed worker CPU time fell from 391.6 ms to 1.2 ms, a 99.7% reduction. These are medians of three release-mode local runs.
+- Selecting recipients for 30,000 directed ARP frames with 120 peers fell from 60.8 ms to 1.2 ms (50.6× faster). Preparing 2,000 name-sorted desktop peer lists fell from 381.9 ms to 29.1 ms (13.1× faster). These are medians of nine alternating optimized runs.
+- One 120-peer desktop list used 127 allocation/reallocation calls instead of 2,651, with peak temporary live heap falling from 71,924 to 7,504 bytes (89.6% less). The existing snapshot is excluded.
+- These figures measure individual operations, not whole-application CPU, process RSS, or VPN throughput. Each established peer retains a 1,536-byte send buffer to reduce transient allocations. See `docs/performance.md` for methodology.
+
+### Validation
+
+- Added forwarding equivalence, buffer reuse, checksum split, exact UDP command/ACK, sequence wraparound, retry, cancellation, concurrent notification, and snapshot coalescing tests. A local UDP load test checks every byte and delivery order across 1,024 full-size Ethernet frames.
+- Passed 147 default workspace tests, formatting, Clippy with warnings denied, and host release builds. The explicit idle CPU benchmark was also run. The privileged TAP test remains opt-in; no new live interoperability session or process-RSS measurement was performed during this release preparation.
+
+## 0.7.0 — 2026-09-28
+
+### Headless CLI and service
+
+- Replaced the short, bounded CLI connection workflow with a persistent per-user service. Closing the terminal no longer closes the server session, peer channels, or nonpersistent Linux TAP interface. The service refreshes memberships and reconnects after server failures with bounded backoff.
+- Added `init`, `start`, `status`, `stop`, `networks`, `peers`, `search`, `join`, `create`, `leave`, `delete`, `kick`, `grant-admin`, `revoke-admin`, `retry-peers`, and `retry-interface` commands. `start --no-tap` supports control-only sessions, and `--json` provides machine-readable replies.
+- Added a private profile directory, owner-only Unix control socket, single-instance lock, bounded command/reply sizes, service log, and reusable identity and public-modulus storage. Private-network passwords still come from files rather than command arguments and are not saved by the service.
+- Correlated network-operation replies with the requesting CLI command, including search results, refusals, timeouts, and disconnected sessions. Network administration uses exact names or IDs and requires explicit confirmation for deletion. Removed the former bounded `run` and report-oriented CLI command syntax; see `docs/cli.md` when upgrading scripts.
+
+### Peer recovery and desktop
+
+- Reduced retry delays to 1.5–4.5 seconds after the first failure, 3–9 after the second, 6–18 after the third, and 12–36 for later failures. Recovery can begin while new peers are connecting, with previously connected channels and incoming offers prioritized.
+- Scaled concurrent outgoing retries to 16, 32, or 48 according to backlog, starting attempts 200, 100, or 50 milliseconds apart. Recent high failure rates reduce retry pressure; due retries reserve setup capacity without blocking incoming offers or all new peers.
+- Added failed/refused, offline, active-retry, and queued-retry counts to the desktop network page. Desktop redraws no longer clone the sidebar and network-selector lists.
+
+### Memory and CPU
+
+- Shared outgoing Ethernet frame payloads across peer queues during fan-out and reused the TAP read buffer. A 1,514-byte frame queued for 120 peers avoids about 176 KiB of duplicate payloads; 64 such queued frames avoid about 11 MiB. These are payload-size calculations, not measured process RSS.
+- Validated UDP checksums without copying datagrams; deferred payload copies for duplicate reliable commands and fragments; retransmitted from saved commands without cloning them.
+- Replaced eight checksum bit steps per byte with a 256-entry lookup table. Reserved final buffer sizes for encryption and TLV output.
+- On Linux x86-64, nine alternating optimized local microbenchmark runs had these medians: 30,000 checksums of 1,400-byte packets took 201.4 ms before and 74.6 ms after (2.7× faster); queuing and draining 2,000 1,514-byte frames across 120 peer channels took 45.0 ms before and 6.2 ms after (7.3× faster). These measure isolated operations, not end-to-end VPN throughput.
+
+### Validation
+
+- Added headless persistent-service, command-correlation, adaptive-recovery, shared-buffer, and checksum-equivalence tests using synthetic data and local sockets. Fixed wire vectors still pass.
+- Passed workspace tests, formatting, Clippy with warnings denied, and a Linux release build. The privileged TAP test remains opt-in; live NAT and process-RSS measurements were not performed.
+
+## 0.6.0 — 2026-09-28
+
+### Fixed
+
+- Fixed private-network authentication compatibility when joining or creating networks with the official client.
+
+### Desktop
+
+- Added settings for the maximum reconnect attempts and initial retry delay, with bounded exponential backoff.
+- Added startup page, traffic display and units, offline-peer visibility, peer sorting, recent activity count, and developer diagnostic display preferences.
+- Added Save, Discard, and Restore defaults actions for preferences. Existing settings files receive defaults for the new fields.
+
+### Validation
+
+- Confirmed private-network joins through both development and release CLIs using the test network, followed by a fresh membership check.
+- Passed the default workspace tests, formatting, Clippy, and the Linux release build. The privileged TAP test remains opt-in.
+
+## 0.5.0 — 2026-09-27
+
+- Retry refused peers with bounded per-peer backoff of 7.5–22.5, 15–45, then 30–90 seconds. Wait five seconds for initial setup to settle; pace retries 2–4 seconds apart with four outgoing retries at once, while incoming offers can bypass the wait. Manual retries preserve failure history.
+- Give direct TCP/UDP four seconds of preference over relay, extending to eight seconds after a relay ticket for late direct attempts; start relay sooner when direct options are exhausted. Apply the same preference to incoming channels except explicit relay-only diagnostics.
+- Announce the TAP address with a 42-byte gratuitous ARP reply when authenticated channels become ready and when the TAP is recreated. Apply the desktop Ethernet validation and explicit traffic allowlist to CLI forwarding, preserving source IP/MAC and membership checks.
+- Publish Linux x86-64 binaries built with Rust 1.95 on Debian 12. Development regressions passed before the final timing adjustment; they were not rerun for that adjustment. [Published release](https://github.com/gringoestrangeiro/openrad/releases/tag/v0.5.0).
+
+## 0.4.0 — 2026-09-27
+
+- Increase outgoing handshake capacity to 64 with 80 total slots and reserved incoming capacity. Discover UDP mappings concurrently through both authenticated servers, requiring agreement, independently of direct/relay setup.
+- Start direct transports as candidates arrive, with two TCP workers so an unresponsive address does not hold up others. Start relay 750 ms after its ticket; the first fully authenticated peer/service connection wins.
+- Prioritize first attempts over retries within traffic priority, start initial transient retries after 500–625 ms, enlarge bounded offer/advertisement queues, and promptly cancel superseded Linux TCP connects.
+- Accept member-removal/status events containing mandatory subject and optional source identifiers with the same tag without disconnecting or confusing their roles; retain strict singleton checks elsewhere.
+- Pass 111 headless tests, formatting, and Clippy; publish Linux binaries requiring glibc 2.35+. [Published release](https://github.com/gringoestrangeiro/openrad/releases/tag/v0.4.0).
+
+## 0.3.0 — 2026-09-27
+
+- Keep attachment heartbeats running under queue pressure and separate packet/counter work from lifecycle events. Preserve established peers across equivalent online roster states and consume queued UDP ACKs before timeout checks.
+- Retry transient peer failures with individual staggered backoff. Keep search timeout, full command queues, and TAP read failures from unnecessarily ending the whole session; reconnect after uncertain membership mutations.
+- Add persistent session/peer/transport/retry/roster/heartbeat/queue diagnostics rotating over four 4 MiB files, without passwords, keys, or payloads. Show peer failure details in Recent activity and add Copy connection log path.
+- Pass 99 headless tests, formatting, and Clippy; publish Linux binaries requiring glibc 2.35+. [Published release](https://github.com/gringoestrangeiro/openrad/releases/tag/v0.3.0).
+
+## 0.2.0 — 2026-09-27
+
+- Add password-protected private-network creation and joining to the desktop and CLI, private membership views, administrator-authorized member removal and permission grants/revocations, and owner-authorized network deletion.
+- Use passwords only during authenticated operations and retain OS credential storage, public discovery/joining, and the 0.1.0 transport/I/O improvements.
+- Publish experimental Linux x86-64 binaries built with Rust 1.95 on Debian 12, requiring glibc 2.35+, with guides, license, build information, and checksums. [Published release](https://github.com/gringoestrangeiro/openrad/releases/tag/v0.2.0).
+
+## 0.1.0 — 2026-09-27
+
+- Release the native Linux desktop and headless CLI with public networks, direct TCP/UDP, and relay transport; private-network management arrived in 0.2.0.
+- Run up to 24 concurrent outgoing handshakes with 32 total slots to retain incoming capacity. Use Linux poll readiness and vectored TCP writes, reduce Ethernet allocations, avoid redundant membership updates, and omit JSON serialization for disabled reports.
+- Preserve protocol, cryptography, authentication, UDP formats, and deadlines. Seven-run local medians improved 100,000 idle socket checks from 37.97 to 21.66 ms, 200,000 Ethernet encodes from 12.55 to 5.26 ms, and 10,000 localhost TCP frames from 27.65 to 14.68 ms; these measure local overhead.
+- Publish experimental Linux x86-64 binaries built with Rust 1.95 on Debian 12, requiring glibc 2.35+, with setup/license/build/performance documentation and checksums. [Published release](https://github.com/gringoestrangeiro/openrad/releases/tag/v0.1.0).
