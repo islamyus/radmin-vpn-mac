@@ -79,6 +79,15 @@ else:
     run('/usr/bin/security', 'unlock-keychain', '-p', password, str(keychain))
 fingerprint = hashlib.sha1(der.read_bytes()).hexdigest()
 requirement = 'designated => identifier "{}" and certificate leaf = H"{}"'.format(args.identifier, fingerprint)
-run('/usr/bin/codesign', '--force', '--sign', fingerprint, '--keychain', str(keychain), '--timestamp=none', '--identifier', args.identifier, '--requirements', '=' + requirement, str(args.path))
+# Identity lookup can also consult the user's keychain search list, even when
+# codesign is passed --keychain. Include only our private chain temporarily and
+# restore every original entry; no trust settings or login-key ACLs are changed.
+search_list = shlex.split(run('/usr/bin/security', 'list-keychains', '-d', 'user').decode())
+try:
+    if str(keychain) not in search_list:
+        run('/usr/bin/security', 'list-keychains', '-d', 'user', '-s', *search_list, str(keychain))
+    run('/usr/bin/codesign', '--force', '--sign', fingerprint, '--keychain', str(keychain), '--timestamp=none', '--identifier', args.identifier, '--requirements', '=' + requirement, str(args.path))
+finally:
+    run('/usr/bin/security', 'list-keychains', '-d', 'user', '-s', *search_list)
 run('/usr/bin/codesign', '--verify', '--strict', str(args.path))
 print('Signed with stable local identity:', args.path.name)
