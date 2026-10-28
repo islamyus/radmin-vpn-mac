@@ -3,7 +3,9 @@ set -euo pipefail
 ROOT="${0:A:h:h}"
 cd "$ROOT"
 zsh scripts/build-engine.sh
-swift build -c release
+swift build -c release -Xswiftc -file-prefix-map -Xswiftc "$HOME=/build" \
+    -Xswiftc -file-prefix-map -Xswiftc "$ROOT=/source" \
+    -Xcc "-ffile-prefix-map=$HOME=/build" -Xcc "-ffile-prefix-map=$ROOT=/source"
 BIN="$(swift build -c release --show-bin-path)"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 APP="$ROOT/dist/Radmin VPN Native-$STAMP.app"
