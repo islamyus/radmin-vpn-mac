@@ -12,6 +12,11 @@ The helper compiler discovers the installed SDK through `xcrun`. Set
 the usual full Xcode installation when present. Rust can come from your PATH or
 the optional ignored `build/toolchain/` development installation.
 
+OpenRad's Unix-socket fixtures require a short temporary-directory path. If a
+library test reports `data directory path is too long for a Unix socket`, set
+`TMPDIR` to an existing short, private directory before running it. CI uses the
+runner's short temporary root rather than the longer checkout path.
+
 ## Package
 
 ```sh

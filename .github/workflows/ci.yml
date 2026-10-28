@@ -12,7 +12,9 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 30
     env:
-      TMPDIR: ${{ github.workspace }}/build/tmp
+      # Darwin Unix sockets have a short path limit; upstream profile fixtures
+      # append descriptive names, so use the runner's shorter private temp root.
+      TMPDIR: ${{ runner.temp }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -23,8 +25,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable action
         with:
           toolchain: '1.95.0'
-      - name: Prepare local temporary directory
-        run: mkdir -p build/tmp
+      - name: Check temporary directory
+        run: test -d "$TMPDIR"
       - name: Check public source
         run: python3 scripts/check-public-source.py
       - name: Swift tests
